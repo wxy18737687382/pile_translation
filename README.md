@@ -1,6 +1,10 @@
-# 学术文献原版对照翻译流水线 (MinerU + 1:1 Side-by-Side Pipeline)
+# 学术文献原版对照翻译流水线 (Pile Translation / MinerU + 1:1 Side-by-Side Pipeline)
 
-专为学术文献设计的翻译伴读系统，采用 **“MinerU 文档前置处理引擎 + 全文 Markdown 上下文翻译 + 1:1 原版坐标左右对照生成”** 架构。
+[![Release](https://img.shields.io/github/v/release/wxy18737687382/pile_translation?color=blue)](https://github.com/wxy18737687382/pile_translation/releases)
+[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+专为学术文献设计的翻译伴读系统，采用 **“MinerU 文档前置处理引擎 + 全文 Markdown 上下文翻译 + 1:1 原版坐标左右对照生成”** 架构。现已支持标准 Python Package 打包分发与 CLI 命令行全局调用。
 
 ---
 
@@ -35,9 +39,49 @@
 
 ---
 
-## 🚀 快速上手
+## 📦 安装与打包 (Packaging & Installation)
+
+本仓库遵循 PEP 517 / PEP 621 标准 Python 打包规范。
+
+### 方式 1：直接从源码或 Git 安装
+
+```bash
+# 直接从 GitHub 仓库安装全局 CLI 工具
+pip install git+https://github.com/wxy18737687382/pile_translation.git
+
+# 或者克隆本仓库后本地安装
+git clone https://github.com/wxy18737687382/pile_translation.git
+cd pile_translation
+pip install .
+```
+
+### 方式 2：使用构建产物 (Wheel 安装)
+
+从 [GitHub Releases](https://github.com/wxy18737687382/pile_translation/releases) 页面下载最新版本的 `.whl` 文件：
+
+```bash
+pip install pile_translation-0.1.0-py3-none-any.whl
+```
+
+### 方式 3：开发者本地构建 (Build Distribution)
+
+使用 `uv` 快速构建标准的 Wheel 二进制包与源码包：
+
+```bash
+# 安装 uv (如果尚未安装)
+pip install uv
+
+# 一键构建出 dist/*.whl 与 dist/*.tar.gz
+uv build
+```
+
+---
+
+## 🚀 快速上手 (CLI Usage)
 
 ### 1. 配置环境变量 (`.env`)
+
+在运行目录创建 `.env` 文件（或参考 `.env.example`）：
 
 ```bash
 # 翻译大模型密钥 (DeepSeek / OpenAI / Gemini 兼容端点):
@@ -48,15 +92,89 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 UNIMERNET_API_URL=http://127.0.0.1:8000/predict
 ```
 
-### 2. (可选) 启动本地 UniMERNet 公式识别微服务
+### 2. 使用全局命令行工具
+
+安装后，可直接在任意终端中使用 `pile-translate` 命令：
+
+```bash
+# 基础运行（输入文献 PDF，输出到 ./output 目录）
+pile-translate paper.pdf -o ./output
+
+# 指定并发线程数与模型
+pile-translate paper.pdf --workers 8 --model deepseek-chat
+
+# 启用两阶段反思润色与动态长度分块
+pile-translate paper.pdf -g dynamic --target-length 350 --enable-reflection
+
+# 仿真测试模式（不调用远程 API，快速验证版面解析与排版导出）
+pile-translate paper.pdf --mock
+
+# 查看帮助与版本号
+pile-translate --help
+pile-translate --version
+```
+
+*(也可以继续通过源码运行 `python main.py paper.pdf`)*
+
+---
+
+## 🐍 Python 代码调用 (Python API)
+
+您也可以将 `pile-translation` 作为 Python 库引入自己的工程：
+
+```python
+from pipeline import run_pipeline, AcademicTranslator, DocumentParser, DocumentExporter
+
+# 1. 一键运行完整翻译流水线
+run_pipeline(
+    input_file="path/to/paper.pdf",
+    output_dir="./output",
+    granularity="paragraph",
+    model_name="deepseek-chat",
+    workers=8
+)
+
+# 2. 或单独调用核心组件
+parser = DocumentParser()
+blocks = parser.parse("path/to/paper.pdf")
+```
+
+---
+
+## 🏷️ GitHub 版本更替发布流程 (Release Workflow)
+
+项目已配置 GitHub Actions 自动化 CI/CD 工作流（`.github/workflows/release.yml`）。
+
+当需要发布新版本时：
+
+1. **更新版本号**：
+   在 `pyproject.toml` 与 `pipeline/__version__.py` 中更新版本号（例如 `0.2.0`）。
+
+2. **打标签并推送到 GitHub**：
+   ```bash
+   git add pyproject.toml pipeline/__version__.py
+   git commit -m "chore: bump version to 0.2.0"
+   git tag v0.2.0
+   git push origin main --tags
+   ```
+
+3. **自动化构建与发布**：
+   GitHub Actions 将自动触发：
+   - 检出代码并拉取环境
+   - 执行 `uv build` 构建最新的 Wheel 和 Source Distribution
+   - 自动在 GitHub 创建对应 Tag 的 Release，并将 `.whl` 和 `.tar.gz` 打包文件上传至 Release 附件，供所有人直接下载使用！
+
+---
+
+## 🔬 本地 UniMERNet 公式识别微服务（可选）
+
 如需使用本地 GPU 加速运行 UniMERNet 公式大模型：
 1. 双击运行 `services/unimernet_service/setup_unimernet_env.bat`（一键在 Conda 中创建专属隔离环境并配置依赖）。
 2. 双击运行 `services/unimernet_service/start_service.bat`（启动微服务，监听 8000 端口）。
 *(注：若未启动该服务，流水线将自动优雅降级为内置的高精 TeX 解码引擎，保证翻译始终流畅进行)*
 
-### 3. 运行原版对照翻译流水线
+---
 
-```bash
-# 默认处理 ./2026.06.02.26354731v1.full.pdf，自动启用多线程并发翻译与本地译文缓存
-.venv\Scripts\python.exe main.py 2026.06.02.26354731v1.full.pdf --workers 8
-```
+## 📄 开源许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
