@@ -1,0 +1,29 @@
+model:
+  arch: unimernet
+  model_type: unimernet
+  load_pretrained: True
+  pretrained: "services/unimernet_service/weights/unimernet_base/unimernet_base.pth"
+  tokenizer_name: nougat
+  tokenizer_config:
+    path: "services/unimernet_service/weights/unimernet_base"
+  model_name: unimernet
+  model_config:
+    model_name: "services/unimernet_service/weights/unimernet_base"
+    max_seq_len: 1536
+
+datasets:
+  formula_rec_eval:
+    vis_processor:
+      eval:
+        name: "formula_image_eval"
+        image_size: [192, 672]
+
+run:
+  task: unimernet_train
+  evaluate: True
+  batch_size_train: 64
+  batch_size_eval: 64
+  generate_cfg:
+    temperature: 0.0
+    do_sample: False
+    top_p: 0.95
