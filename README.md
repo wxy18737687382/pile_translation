@@ -92,7 +92,19 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 UNIMERNET_API_URL=http://127.0.0.1:8000/predict
 ```
 
-### 2. 使用全局命令行工具
+### 2. 本地 MinerU / magic-pdf 版面解析引擎
+系统优先调用本地 MinerU (`magic-pdf`) 引擎执行 GPU 深度解析：
+- **CLI 命令行**：已支持在终端直接使用 `magic-pdf -p <pdf> -o <out_dir> -m auto`。
+- **环境验证测试**：提供 `services/magic_pdf_service/test_parse.bat` 脚本，可一键验证本地 GPU 版面解析环境。
+- **流水线自动适配**：运行主流水线时，系统自动检测并优先调用本地 MinerU CLI 解析 PDF 几何结构、提取插图、还原脚注与公式边界。
+
+### 3. 本地 UniMERNet 公式识别微服务 (GPU CUDA 加速)
+为实现复杂独立数学公式的高精度识别与 LaTeX 重建：
+1. **环境准备**：运行 `services/unimernet_service/setup_unimernet_env.bat` 一键配置 Conda 隔离环境。
+2. **启动微服务**：运行 `services/unimernet_service/start_service.bat` 启动微服务（监听 8000 端口，常驻显存毫秒级响应）。
+3. **健康检测与自动唤起**：流水线内置自愈与健康探测机制，亦可通过 `services/unimernet_service/test_client.py` 单独测试图片公式推理。
+
+### 4. 使用全局命令行工具
 
 安装后，可直接在任意终端中使用 `pile-translate` 命令：
 

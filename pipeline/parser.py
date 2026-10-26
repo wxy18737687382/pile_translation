@@ -7,15 +7,24 @@ from pipeline.mineru_engine import MinerUEngine
 
 class DocumentParser:
     """
-    Parses input documents (PDF, Markdown, or plain text):
-    - For PDF documents: Invokes MinerU as the document pre-processing engine to extract structured
-      full Markdown (full.md), inline images (images/*.png), and DocumentBlocks with exact page
-      coordinates (page_num, bbox) and formatting tags (<sup>/<sub>).
-    - For Markdown/Text documents: Directly parses into structured DocumentBlock items.
+    负责解析输入文档（PDF 或 Markdown/Text）：
+    - 针对 PDF 文档：接入 MinerU 作为文档前置处理引擎，先提取全文结构化 Markdown (full.md)、
+      原位插图 (images/*.png) 以及带精确页面坐标 (page_num, bbox) 与角注 (<sup>/<sub>) 的 DocumentBlock 列表。
+    - 针对 Markdown/Text 文档：直接解析为结构化 DocumentBlock 列表。
     """
 
-    def __init__(self, mineru_mode: str = "auto", mineru_api_key: Optional[str] = None):
-        self.mineru_engine = MinerUEngine(mode=mineru_mode, api_key=mineru_api_key)
+    def __init__(
+        self,
+        mineru_mode: str = "auto",
+        mineru_api_key: Optional[str] = None,
+        para_format: str = "reorganize"
+    ):
+        self.para_format = para_format
+        self.mineru_engine = MinerUEngine(
+            mode=mineru_mode,
+            api_key=mineru_api_key,
+            para_format=para_format
+        )
         self.last_full_markdown: Optional[str] = None
         self.last_mineru_dir: Optional[Path] = None
 
@@ -35,26 +44,26 @@ class DocumentParser:
                 self.last_full_markdown = text
                 return self.parse_markdown(text)
             else:
-                raise ValueError(f"Unsupported file format: {suffix}, supported: .pdf, .md, .txt")
+                raise ValueError(f"不支持的文件格式: {suffix}，支持 .pdf, .md, .txt")
         else:
             text = str(source)
             self.last_full_markdown = text
             return self.parse_markdown(text)
 
     def parse_pdf(self, pdf_path: Path, output_dir: Path = Path("./output")) -> List[DocumentBlock]:
-        """Uses MinerU pre-processing engine to extract full Markdown, images, footnotes, and PDF bboxes"""
+        """使用 MinerU 前置处理引擎提取全文 Markdown、插图、角注及精确 PDF 坐标块"""
         output_dir.mkdir(parents=True, exist_ok=True)
         full_md, blocks, mineru_dir = self.mineru_engine.process_pdf(pdf_path, output_dir)
         self.last_full_markdown = full_md
         self.last_mineru_dir = mineru_dir
 
-        # Save extracted source Markdown into the output directory
+        # 将前置引擎提取的全文英文 Markdown 保存至输出目录
         source_md_path = output_dir / f"{pdf_path.stem}_source.md"
         source_md_path.write_text(full_md, encoding="utf-8")
         return blocks
 
     def parse_markdown(self, markdown_text: str) -> List[DocumentBlock]:
-        """Parses raw Markdown text into a list of atomic DocumentBlocks"""
+        """将 Markdown 文本解析为原子 Block 列表"""
         blocks: List[DocumentBlock] = []
         lines = markdown_text.splitlines()
 
@@ -66,12 +75,12 @@ class DocumentParser:
             line = lines[i]
             stripped = line.strip()
 
-            # 1. Skip empty lines
+            # 1. 空行跳过
             if not stripped:
                 i += 1
                 continue
 
-            # 2. Multi-line code block (```)
+            # 2. 多行代码块 (```)
             if stripped.startswith("```"):
                 code_lines = [line]
                 i += 1
@@ -89,7 +98,7 @@ class DocumentParser:
                 block_counter += 1
                 continue
 
-            # 3. Standalone math display block ($$)
+            # 3. 独立公式块 ($$)
             if stripped.startswith("$$"):
                 math_lines = [line]
                 if stripped.endswith("$$") and len(stripped) > 2:
@@ -110,7 +119,7 @@ class DocumentParser:
                 block_counter += 1
                 continue
 
-            # 4. Standalone image line (![alt](path))
+            # 4. 独立插图行 (![alt](path))
             if re.match(r"^!\[.*?\]\(.*?\)$", stripped):
                 m_img = re.match(r"^!\[.*?\]\((.*?)\)$", stripped)
                 blocks.append(DocumentBlock(
@@ -125,7 +134,7 @@ class DocumentParser:
                 i += 1
                 continue
 
-            # 5. Table block (| ... |)
+            # 5. 表格块 (| ... |)
             if stripped.startswith("|") and stripped.endswith("|"):
                 table_lines = [line]
                 i += 1
@@ -140,7 +149,7 @@ class DocumentParser:
                 block_counter += 1
                 continue
 
-            # 6. Horizontal rule (--- or ***)
+            # 6. 分割线 (--- or ***)
             if re.match(r"^(\-{3,}|\*{3,}|_{3,})$", stripped):
                 blocks.append(DocumentBlock(
                     id=f"b_{block_counter}",
@@ -151,7 +160,7 @@ class DocumentParser:
                 i += 1
                 continue
 
-            # 7. Headings (#, ##, ###)
+            # 7. 各级标题 (#, ##, ###)
             header_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
             if header_match:
                 level = len(header_match.group(1))
@@ -166,7 +175,7 @@ class DocumentParser:
                 i += 1
                 continue
 
-            # 8. List items (- item or 1. item)
+            # 8. 列表项 (- item or 1. item)
             list_match = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
             if list_match:
                 list_lines = [line]
@@ -182,7 +191,7 @@ class DocumentParser:
                 block_counter += 1
                 continue
 
-            # 9. Paragraph
+            # 9. 普通段落
             para_lines = [line]
             i += 1
             while i < n:

@@ -28,13 +28,34 @@ class MinerUEngine:
        - builtin-mineru: Built-in high-precision PyMuPDF geometry, footnote, figure, and formula engine
     """
 
-    def __init__(self, mode: str = "auto", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        mode: str = "auto",
+        api_key: Optional[str] = None,
+        para_format: str = "reorganize"
+    ):
         self.mode = mode
         self.api_key = (
             api_key
             or os.getenv("MINERU_API_KEY")
             or os.getenv("MINERU_API_TOKEN")
         )
+        self.para_format = para_format
+
+    @staticmethod
+    def _find_local_cli() -> Optional[str]:
+        """Finds locally installed mineru or magic-pdf binary"""
+        custom_bin = os.getenv("MAGIC_PDF_BIN") or os.getenv("MINERU_BIN")
+        if custom_bin and Path(custom_bin).exists():
+            return str(custom_bin)
+        for name in ("mineru", "magic-pdf"):
+            found = shutil.which(name)
+            if found:
+                return found
+        conda_env_magic_pdf = Path(r"D:\meachine_learning\minicoda\envs\magic_pdf\Scripts\magic-pdf.exe")
+        if conda_env_magic_pdf.exists():
+            return str(conda_env_magic_pdf)
+        return None
 
     def detect_backend(self) -> str:
         """Automatically selects available MinerU backend"""
@@ -42,13 +63,13 @@ class MinerUEngine:
             return self.mode
         if self.api_key and self.api_key.strip() not in ("", "dummy", "your_mineru_api_key_here"):
             return "mineru-api"
-        if shutil.which("mineru") or shutil.which("magic-pdf"):
+        if self._find_local_cli():
             return "mineru-cli"
         return "builtin-mineru"
 
     def process_pdf(self, pdf_path: Path, output_root: Path) -> Tuple[str, List[DocumentBlock], Path]:
         """
-        Executes pre-processing and returns:
+        执行前置处理，返回:
         (full_markdown_text, structured_blocks_with_bbox, mineru_work_dir)
         """
         stem = pdf_path.stem
@@ -146,10 +167,282 @@ class MinerUEngine:
     def _run_mineru_local_cli(
         self, pdf_path: Path, mineru_dir: Path, output_root: Path
     ) -> Tuple[str, List[DocumentBlock], Path]:
-        cmd_bin = shutil.which("mineru") or shutil.which("magic-pdf")
-        cmd = [cmd_bin, "-p", str(pdf_path), "-o", str(mineru_dir), "-m", "auto"]
-        subprocess.run(cmd, check=True)
+        cmd_bin = self._find_local_cli()
+        if not cmd_bin:
+            raise FileNotFoundError("Local mineru or magic-pdf executable not found.")
+        json_files = list(mineru_dir.rglob("*content_list.json"))
+        if not json_files:
+            cmd = [cmd_bin, "-p", str(pdf_path), "-o", str(mineru_dir), "-m", "auto"]
+            env = os.environ.copy()
+            for k in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
+                env.pop(k, None)
+            subprocess.run(cmd, env=env, check=True)
         return self._load_mineru_directory(pdf_path, mineru_dir, output_root)
+
+    def _merge_paragraph_lines(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
+        """
+        段内多行合并与断词清洗（reorganize 重新整理翻译模式）：
+        当 MinerU CLI / content_list.json 将普通段落切碎为每一单行时，
+        在同一页、同分栏内将连续段落行智能聚合为完整的自然段落，
+        并消除行尾连字符（如 espe- \n cially -> especially）。
+        若 para_format 为 by-line，则保持原样逐行独立。
+        """
+        if self.para_format != "reorganize" or not blocks:
+            return blocks
+
+        merged: List[DocumentBlock] = []
+        for b in blocks:
+            if not merged:
+                merged.append(b)
+                continue
+
+            prev = merged[-1]
+
+            # 仅针对普通正文段落执行段内行合并
+            can_merge = (
+                prev.page_num == b.page_num
+                and prev.type == BlockType.PARAGRAPH
+                and b.type == BlockType.PARAGRAPH
+                and not prev.skip_pdf_overlay
+                and not b.skip_pdf_overlay
+                and not prev.metadata.get("is_sidebar")
+                and not b.metadata.get("is_sidebar")
+                and not prev.metadata.get("is_reference")
+                and not b.metadata.get("is_reference")
+                and not prev.metadata.get("is_continuation")
+                and not b.metadata.get("is_continuation")
+                and prev.bbox is not None
+                and b.bbox is not None
+            )
+
+            if not can_merge:
+                merged.append(b)
+                continue
+
+            # 几何间隙与分栏判定
+            py0, py1 = prev.bbox[1], prev.bbox[3]
+            by0, by1 = b.bbox[1], b.bbox[3]
+            v_gap = by0 - py1
+
+            px0, px1 = prev.bbox[0], prev.bbox[2]
+            bx0, bx1 = b.bbox[0], b.bbox[2]
+            h_overlap = max(0.0, min(px1, bx1) - max(px0, bx0))
+            is_same_col = h_overlap > 30.0 or abs(px0 - bx0) < 18.0
+
+            # 真正段落结尾特征：句末标点 + 下一行显著缩进 或 上一行宽度显著过短
+            prev_txt = prev.original_text.strip()
+            is_terminal = prev_txt.endswith((".", "!", "?"))
+            is_b_indented = bx0 > px0 + 8.0
+            is_prev_short = px1 < bx1 - 65.0
+            is_para_break = is_terminal and (is_b_indented or is_prev_short or v_gap > 13.0)
+
+            # 只有在垂直间距正常、同栏且非自然分段时合并
+            if is_same_col and -2.0 <= v_gap <= 14.5 and not is_para_break:
+                prev_text = prev.original_text.strip()
+                b_text = b.original_text.strip()
+
+                # 行末连字符断词缝合
+                m_hyphen = re.search(r"(\b[A-Za-z]+)-\s*$", prev_text)
+                if m_hyphen and b_text and b_text[0].islower():
+                    joined_text = prev_text[:-1] + b_text
+                else:
+                    joined_text = prev_text + " " + b_text
+
+                prev.original_text = joined_text
+                prev.bbox = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
+                continue
+
+            merged.append(b)
+
+        return merged
+
+    @staticmethod
+    def _is_figure_chart_noise(text: str, bbox: Optional[List[float]], pno: int) -> bool:
+        """
+        检测是否为插图内部被错误识别为正文段落的图表坐标轴、刻度标签与 OCR 乱码
+        (例如 Time [s], nPVA [%], 0.0 2.0 2.5, q[um-1], Pore Diameter[um] 等)
+        """
+        if not text:
+            return False
+        words = text.split()
+        axis_units = ('[s]', '[%]', '[um]', '[um-1]', '[mpa]', '[j/cm2]', '[nm]', '[kda]', '[min]', '[h]')
+        axis_tokens = [w for w in words if any(u in w.lower() for u in axis_units)]
+        if len(axis_tokens) >= 2:
+            num_or_short = sum(1 for w in words if re.search(r'^\d+(\.\d+)?$|^[a-j]$', w))
+            if num_or_short >= 4 or len(text.splitlines()) >= 3:
+                return True
+        if '0000' in text and ('FPVA' in text or 'PVA' in text) and len(axis_tokens) >= 1:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_para_bbox_from_middle(
+        item_text: str,
+        para_candidates: List[Dict[str, Any]]
+    ) -> Optional[List[float]]:
+        """从 middle.json 的 para_blocks 候选列表中按文本相似度与顺序提取最佳匹配坐标"""
+        if not para_candidates:
+            return None
+        words = re.findall(r"[a-zA-Z0-9]+", item_text)
+        head_sample = " ".join(words[:5]).lower() if words else ""
+
+        # 1. 优先通过前缀文本词汇匹配
+        if head_sample:
+            for i, pb in enumerate(para_candidates):
+                b = pb.get("bbox")
+                if not b or len(b) != 4 or b[2] <= b[0] or b[3] <= b[1]:
+                    continue
+                pb_spans = [s.get("content", "") for line in pb.get("lines", []) for s in line.get("spans", [])]
+                pb_txt = " ".join(pb_spans)
+                pb_words = re.findall(r"[a-zA-Z0-9]+", pb_txt)
+                pb_sample = " ".join(pb_words[:5]).lower() if pb_words else ""
+                if head_sample in pb_sample or pb_sample in head_sample:
+                    para_candidates.pop(i)
+                    return b
+
+        # 2. 备选：提取第一个有效坐标
+        for i, pb in enumerate(para_candidates):
+            b = pb.get("bbox")
+            if b and len(b) == 4 and b[2] > b[0] and b[3] > b[1]:
+                para_candidates.pop(i)
+                return b
+        return None
+
+    def _stitch_and_reorder_cross_page_blocks(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
+        """
+        换页断词缝合、跨页语义检查与浮动图表重新排序（解决换页拆词被当作两句翻译的问题）：
+        1. 语义检查 (Semantic Check):
+           - 检查页 P 末尾段落是否以连字符断词 (如 espe-) 结尾，且页 P+1 紧随段落以小写字母 (如 cially) 开头；
+           - 检查页 P 末尾段落是否以未完结句式 (无句末句号标点) 跨页断开，且页 P+1 开头为小写字母或语法续词；
+           - 命中时自动缝合单词 (如 espe- + cially -> especially) 并打上跨页伙伴元数据标记。
+        2. 重新排序 (Reordering):
+           - 若页 P+1 顶部出现浮动图表 (IMAGE / IMAGE_CAPTION / TABLE)，但其下方紧随跨页续句；
+           - 在文档流序列中，将跨页续句提升至浮动图表之前，保证人类阅读流与翻译上下文连续不被图表中断！
+        """
+        if not blocks:
+            return blocks
+
+        pages_map: Dict[int, List[DocumentBlock]] = {}
+        for b in blocks:
+            pno = b.page_num if b.page_num is not None else 0
+            pages_map.setdefault(pno, []).append(b)
+
+        sorted_pages = sorted(pages_map.keys())
+        if len(sorted_pages) <= 1:
+            return blocks
+
+        reordered_all_blocks: List[DocumentBlock] = []
+
+        for p_idx, pno in enumerate(sorted_pages):
+            p_blocks = pages_map[pno]
+            if p_idx == len(sorted_pages) - 1:
+                reordered_all_blocks.extend(p_blocks)
+                break
+
+            next_pno = sorted_pages[p_idx + 1]
+            next_blocks = pages_map[next_pno]
+
+            # 寻找当前页末尾的正文段落 (跳过页码与页脚脚注)
+            tail_idx = -1
+            tail_block = None
+            for i in range(len(p_blocks) - 1, -1, -1):
+                b = p_blocks[i]
+                txt_s = b.original_text.strip()
+                if txt_s.isdigit() or len(txt_s) <= 3 or b.type in (BlockType.FOOTNOTE, BlockType.RAW):
+                    continue
+                if b.type in (BlockType.PARAGRAPH, BlockType.LIST_ITEM):
+                    tail_idx = i
+                    tail_block = b
+                    break
+                else:
+                    break
+
+            if tail_block is None:
+                reordered_all_blocks.extend(p_blocks)
+                continue
+
+            # 寻找下一页首个正文段落，并检查其前方是否有浮动图表 (float_prefix)
+            head_idx = -1
+            head_block = None
+            float_prefix: List[DocumentBlock] = []
+
+            for j, nb in enumerate(next_blocks):
+                nb_txt = nb.original_text.strip()
+                if nb_txt.isdigit() or len(nb_txt) <= 3 or nb.type in (BlockType.RAW,):
+                    if nb.type in (BlockType.RAW,):
+                        float_prefix.append(nb)
+                    continue
+                if nb.type in (BlockType.IMAGE, BlockType.IMAGE_CAPTION, BlockType.TABLE) or nb.metadata.get("is_figure_noise"):
+                    float_prefix.append(nb)
+                    continue
+                if nb.type in (BlockType.HEADER_1, BlockType.HEADER_2, BlockType.HEADER_3, BlockType.TITLE):
+                    break
+                if nb.type in (BlockType.PARAGRAPH, BlockType.LIST_ITEM):
+                    head_idx = j
+                    head_block = nb
+                    break
+                break
+
+            if head_block is None:
+                reordered_all_blocks.extend(p_blocks)
+                continue
+
+            # 执行跨页语义检查 (Cross-Page Semantic Check)
+            tail_txt = tail_block.original_text.strip()
+            head_txt = head_block.original_text.strip()
+
+            # 检查 A: 行末连字符断词 (如 espe- 与 cially)
+            m_hyphen = re.search(r"(\b[A-Za-z]+)-\s*$", tail_txt)
+            m_head_word = re.match(r"^\s*([a-zA-Z]+)\b", head_txt)
+            is_hyphen_match = False
+            if m_hyphen and m_head_word:
+                prefix = m_hyphen.group(1)
+                suffix = m_head_word.group(1)
+                if suffix[0].islower():
+                    is_hyphen_match = True
+
+            # 检查 B: 未完结句跨页断开 (末尾无句末终止标点，且后页开头为小写或语法续词)
+            is_incom_match = False
+            if not is_hyphen_match:
+                is_terminal = tail_txt.endswith((".", "!", "?", ":", '"', "”", "$$"))
+                if re.search(r"\b([A-Z]\.[A-Z]?\.|et al\.|Fig\.|e\.g\.|i\.e\.)\s*$", tail_txt, re.IGNORECASE):
+                    is_terminal = False
+                head_is_lower = bool(re.match(r"^(?:<[^>]+>)*[a-z]", head_txt)) or head_txt.startswith("$")
+                head_is_continue_word = bool(re.match(r"^(?:<[^>]+>)*\b(and|or|which|that|with|in|to|for|by|is|are|were|was|of|such|as|from|on|at|likes|acknowledges)\b", head_txt, re.IGNORECASE))
+                if not is_terminal and (head_is_lower or head_is_continue_word):
+                    is_incom_match = True
+                elif head_is_lower and not tail_txt.endswith(("!", "?", ":", "$$")):
+                    is_incom_match = True
+            if is_hyphen_match or is_incom_match:
+                # 1. 消除断词 (Word De-hyphenation)
+                if is_hyphen_match:
+                    joined_word = prefix + suffix
+                    tail_block.original_text = tail_block.original_text[:m_hyphen.start(1)] + joined_word
+                    head_block.original_text = head_block.original_text[m_head_word.end():].lstrip()
+                    tail_block.metadata["cross_page_dehyphen"] = {
+                        "prefix": prefix,
+                        "suffix": suffix,
+                        "joined": joined_word
+                    }
+
+                # 2. 标记跨页双向关联元数据
+                tail_block.is_cross_page_tail = True
+                head_block.is_cross_page_head = True
+                tail_block.cross_page_partner_id = head_block.id
+                head_block.cross_page_partner_id = tail_block.id
+                tail_block.metadata["is_cross_page_tail"] = True
+                head_block.metadata["is_cross_page_head"] = True
+                tail_block.metadata["cross_page_partner_id"] = head_block.id
+                head_block.metadata["cross_page_partner_id"] = tail_block.id
+
+                # 3. 重新排序 (Reordering): 若下一页开篇有浮动图表插入在断句之前，将续句提升至图表前
+                if float_prefix and head_idx != -1:
+                    remaining_next = [b for b in next_blocks if b is not head_block]
+                    pages_map[next_pno] = [head_block] + remaining_next
+
+            reordered_all_blocks.extend(p_blocks)
+
+        return reordered_all_blocks
 
     def _load_mineru_directory(
         self, pdf_path: Path, mineru_dir: Path, output_root: Path
@@ -170,70 +463,390 @@ class MinerUEngine:
         full_md = md_files[0].read_text(encoding="utf-8") if md_files else ""
         content_list = json.loads(json_files[0].read_text(encoding="utf-8"))
 
+        # 读取 middle.json 获取精细版面坐标 (如行间公式/表格/插图/段落/原始行坐标)
+        middle_files = list(mineru_dir.rglob("*middle.json"))
+        page_eq_map: Dict[int, List[Dict[str, Any]]] = {}
+        page_img_map: Dict[int, List[Dict[str, Any]]] = {}
+        page_tbl_map: Dict[int, List[Dict[str, Any]]] = {}
+        page_para_map: Dict[int, List[Dict[str, Any]]] = {}
+        page_pre_map: Dict[int, List[Dict[str, Any]]] = {}
+        if middle_files:
+            try:
+                mid_data = json.loads(middle_files[0].read_text(encoding="utf-8"))
+                for p_info in mid_data.get("pdf_info", []):
+                    p_idx = p_info.get("page_idx", 0)
+                    page_eq_map[p_idx] = list(p_info.get("interline_equations", []))
+                    page_img_map[p_idx] = list(p_info.get("images", []))
+                    page_tbl_map[p_idx] = list(p_info.get("tables", []))
+                    page_para_map[p_idx] = list(p_info.get("para_blocks", []))
+                    page_pre_map[p_idx] = list(p_info.get("preproc_blocks", []))
+            except Exception:
+                pass
+
         doc = pymupdf.open(str(pdf_path))
         blocks: List[DocumentBlock] = []
+        in_references_section = False
+        found_first_title = False
+        page_cl_indices: Dict[int, int] = {}
+
+        def _extract_pre_txt(pr: Dict[str, Any]) -> str:
+            return " ".join([s.get("content", "") for l in pr.get("lines", []) for s in l.get("spans", [])]).strip()
+
         for idx, item in enumerate(content_list):
             pno = item.get("page_idx", 0)
             page = doc[pno] if 0 <= pno < len(doc) else doc[0]
             pw, ph = page.rect.width, page.rect.height
-            raw_bbox = item.get("bbox", [0, 0, 0, 0])
-            # Convert normalized coordinates (0-1000) in content_list.json to points (pt) if necessary
-            if raw_bbox and max(raw_bbox) > max(pw, ph):
-                bbox = [
-                    round(raw_bbox[0] * pw / 1000.0, 2),
-                    round(raw_bbox[1] * ph / 1000.0, 2),
-                    round(raw_bbox[2] * pw / 1000.0, 2),
-                    round(raw_bbox[3] * ph / 1000.0, 2),
-                ]
-            else:
-                bbox = [round(float(x), 2) for x in raw_bbox] if len(raw_bbox) == 4 else None
-
             m_type = item.get("type", "text")
-            text = (item.get("text") or "").strip()
-            img_path = item.get("img_path")
-            if m_type == "image" and img_path:
+            raw_bbox = item.get("bbox")
+
+            p_idx = page_cl_indices.get(pno, 0)
+            page_cl_indices[pno] = p_idx + 1
+            cur_pb = page_para_map.get(pno, [])[p_idx] if p_idx < len(page_para_map.get(pno, [])) else None
+
+            # 1. 插图与图题注处理 (含多栏图题注提取与跨栏配对)
+            if m_type == "image":
+                im_obj = page_img_map[pno].pop(0) if page_img_map.get(pno) else {}
+                im_blocks = im_obj.get("blocks", [])
+                body_b = next((b.get("bbox") for b in im_blocks if b.get("type") == "image_body"), None)
+                if not body_b:
+                    body_b = im_obj.get("bbox") or raw_bbox
+                if not body_b or body_b == []:
+                    p_imgs = page.get_images()
+                    if p_imgs:
+                        max_rect = None
+                        max_area = 0.0
+                        for img_info in p_imgs:
+                            xref = img_info[0]
+                            r_list = page.get_image_rects(xref)
+                            for r in r_list:
+                                area = (r.x1 - r.x0) * (r.y1 - r.y0)
+                                if area > max_area and area > 1000.0:
+                                    max_area = area
+                                    max_rect = [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)]
+                        if max_rect:
+                            body_b = max_rect
+                if not body_b or body_b == []:
+                    body_b = [50.0, 50.0, pw - 50.0, ph / 2.0]
+
+                img_path = item.get("img_path") or f"images/p{pno}_img.png"
                 img_name = Path(img_path).name
                 rel_img = f"images/{img_name}"
                 blocks.append(DocumentBlock(
-                    id=f"p{pno}_b{idx}",
+                    id=f"p{pno}_b{idx}_img",
                     type=BlockType.IMAGE,
                     original_text=f"![{img_name}]({rel_img})",
                     translated_text=f"![{img_name}]({rel_img})",
                     page_num=pno,
-                    bbox=bbox,
+                    bbox=body_b,
                     page_width=pw,
                     page_height=ph,
                     image_path=rel_img,
                     skip_pdf_overlay=True
                 ))
+
+                # 图题注 (支持两栏多题注块拆分与协同配对翻译)
+                cap_blocks = [b for b in im_blocks if b.get("type") == "image_caption"]
                 caption_list = item.get("img_caption") or item.get("image_caption") or []
-                if caption_list:
-                    cap_text = " ".join(caption_list).strip()
+                cap_text = self._sanitize_text(" ".join(caption_list).strip())
+                if not cap_text and cap_blocks:
+                    cap_spans = [s.get("content", "") for cb in cap_blocks for l in cb.get("lines", []) for s in l.get("spans", [])]
+                    cap_text = self._sanitize_text(" ".join(cap_spans).strip())
+
+                if cap_text and cap_blocks:
+                    cap_b0 = cap_blocks[0].get("bbox")
+                    if len(cap_blocks) > 1:
+                        cap_id_1 = f"p{pno}_b{idx}_cap"
+                        cap_id_2 = f"p{pno}_b{idx}_cap_col2"
+                        cap_b1 = cap_blocks[1].get("bbox")
+                        spans_0 = [s.get("content", "") for l in cap_blocks[0].get("lines", []) for s in l.get("spans", [])]
+                        spans_1 = [s.get("content", "") for l in cap_blocks[1].get("lines", []) for s in l.get("spans", [])]
+                        txt_0 = self._sanitize_text(" ".join(spans_0))
+                        txt_1 = self._sanitize_text(" ".join(spans_1))
+                        b_cap1 = DocumentBlock(
+                            id=cap_id_1,
+                            type=BlockType.IMAGE_CAPTION,
+                            original_text=txt_0 or cap_text,
+                            page_num=pno,
+                            bbox=cap_b0,
+                            page_width=pw,
+                            page_height=ph,
+                            font_size=8.5,
+                            align="left",
+                            skip_pdf_overlay=False,
+                            is_cross_page_tail=True,
+                            cross_page_partner_id=cap_id_2,
+                            metadata={"has_continuation": True, "continuation_id": cap_id_2, "full_combined_text": cap_text}
+                        )
+                        b_cap2 = DocumentBlock(
+                            id=cap_id_2,
+                            type=BlockType.IMAGE_CAPTION,
+                            original_text=txt_1,
+                            page_num=pno,
+                            bbox=cap_b1,
+                            page_width=pw,
+                            page_height=ph,
+                            font_size=8.5,
+                            align="left",
+                            skip_pdf_overlay=False,
+                            is_cross_page_head=True,
+                            cross_page_partner_id=cap_id_1,
+                            metadata={"is_continuation": True, "parent_id": cap_id_1}
+                        )
+                        blocks.append(b_cap1)
+                        blocks.append(b_cap2)
+                    else:
+                        blocks.append(DocumentBlock(
+                            id=f"p{pno}_b{idx}_cap",
+                            type=BlockType.IMAGE_CAPTION,
+                            original_text=cap_text,
+                            page_num=pno,
+                            bbox=cap_b0,
+                            page_width=pw,
+                            page_height=ph,
+                            font_size=8.5,
+                            align="left",
+                            skip_pdf_overlay=False
+                        ))
+                continue
+
+            # 2. 表格与表题注、表注处理 (防止表格标题与注释漏译遗留英文)
+            if m_type == "table":
+                tbl_obj = page_tbl_map[pno].pop(0) if page_tbl_map.get(pno) else {}
+                tbl_blocks = tbl_obj.get("blocks", [])
+                cap_b = next((b for b in tbl_blocks if b.get("type") == "table_caption"), None)
+                body_b = next((b.get("bbox") for b in tbl_blocks if b.get("type") == "table_body"), None) or tbl_obj.get("bbox")
+                fn_b = next((b for b in tbl_blocks if b.get("type") == "table_footnote"), None)
+
+                tbl_cap_txt = self._sanitize_text(" ".join(item.get("table_caption") or []))
+                if not tbl_cap_txt and cap_b:
+                    spans = [s.get("content", "") for l in cap_b.get("lines", []) for s in l.get("spans", [])]
+                    tbl_cap_txt = self._sanitize_text(" ".join(spans))
+                if tbl_cap_txt:
                     blocks.append(DocumentBlock(
-                        id=f"p{pno}_b{idx}_cap",
-                        type=BlockType.IMAGE_CAPTION,
-                        original_text=cap_text,
+                        id=f"p{pno}_b{idx}_tblcap",
+                        type=BlockType.HEADER_3,
+                        original_text=tbl_cap_txt,
+                        page_num=pno,
+                        bbox=cap_b.get("bbox") if cap_b else None,
+                        page_width=pw,
+                        page_height=ph,
+                        font_size=9.0,
+                        is_bold=True,
+                        skip_pdf_overlay=False,
+                        metadata={"is_table_caption": True}
+                    ))
+
+                blocks.append(DocumentBlock(
+                    id=f"p{pno}_b{idx}_tbl",
+                    type=BlockType.TABLE,
+                    original_text=f"| Table {idx} |",
+                    translated_text=f"| Table {idx} |",
+                    page_num=pno,
+                    bbox=body_b,
+                    page_width=pw,
+                    page_height=ph,
+                    skip_pdf_overlay=True
+                ))
+
+                tbl_fn_txt = self._sanitize_text(" ".join(item.get("table_footnote") or []))
+                if not tbl_fn_txt and fn_b:
+                    spans = [s.get("content", "") for l in fn_b.get("lines", []) for s in l.get("spans", [])]
+                    tbl_fn_txt = self._sanitize_text(" ".join(spans))
+                if tbl_fn_txt:
+                    blocks.append(DocumentBlock(
+                        id=f"p{pno}_b{idx}_tblfn",
+                        type=BlockType.FOOTNOTE,
+                        original_text=tbl_fn_txt,
+                        page_num=pno,
+                        bbox=fn_b.get("bbox") if fn_b else None,
+                        page_width=pw,
+                        page_height=ph,
+                        font_size=8.0,
+                        skip_pdf_overlay=False,
+                        metadata={"is_table_footnote": True}
+                    ))
+                continue
+
+            # 3. 跨栏/跨页续段处理 (提取被合并标记为 lines_deleted 的第二栏或跨页第一栏物理区域)
+            text = self._sanitize_text((item.get("text") or "").strip())
+            if not text:
+                if cur_pb and cur_pb.get("lines_deleted"):
+                    b_cont = cur_pb.get("bbox")
+                    match_pre = [pr for pr in page_pre_map.get(pno, []) if pr.get("bbox") == b_cont]
+                    cont_txt = _extract_pre_txt(match_pre[0]) if match_pre else ""
+
+                    # 寻找前置主段落 (同页优先，否则跨页上溯)
+                    parent = None
+                    for b_cand in reversed(blocks):
+                        if b_cand.type in (BlockType.PARAGRAPH, BlockType.LIST_ITEM, BlockType.REFERENCE):
+                            parent = b_cand
+                            break
+
+                    if parent and cont_txt:
+                        cont_id = f"p{pno}_b{idx}_cont"
+                        cont_block = DocumentBlock(
+                            id=cont_id,
+                            type=parent.type,
+                            original_text=cont_txt,
+                            page_num=pno,
+                            bbox=b_cont,
+                            page_width=pw,
+                            page_height=ph,
+                            font_size=parent.font_size,
+                            skip_pdf_overlay=parent.skip_pdf_overlay,
+                            metadata={
+                                "is_continuation": True,
+                                "parent_id": parent.id,
+                                "is_cross_col": (parent.page_num == pno)
+                            }
+                        )
+
+                        full_text = parent.metadata.get("full_combined_text") or parent.original_text
+                        if full_text.endswith(cont_txt):
+                            parent.original_text = full_text[:-len(cont_txt)].strip()
+                        else:
+                            p_match = [pr for pr in page_pre_map.get(parent.page_num, []) if pr.get("bbox") == parent.bbox]
+                            if p_match:
+                                parent.original_text = _extract_pre_txt(p_match[0])
+
+                        parent.is_cross_page_tail = True
+                        parent.cross_page_partner_id = cont_id
+                        cont_block.is_cross_page_head = True
+                        cont_block.cross_page_partner_id = parent.id
+                        parent.metadata["has_continuation"] = True
+                        parent.metadata["continuation_id"] = cont_id
+                        parent.metadata["full_combined_text"] = full_text
+
+                        blocks.append(cont_block)
+                continue
+
+            # 4. 普通正文段落与标题坐标分配
+            if (not raw_bbox or raw_bbox == [0, 0, 0, 0] or len(raw_bbox) != 4):
+                if m_type in ("equation", "interline_equation") and page_eq_map.get(pno):
+                    raw_bbox = page_eq_map[pno].pop(0).get("bbox")
+                elif cur_pb and cur_pb.get("bbox"):
+                    raw_bbox = cur_pb.get("bbox")
+                elif page_para_map.get(pno):
+                    raw_bbox = self._extract_para_bbox_from_middle(text, page_para_map[pno])
+
+            if raw_bbox and len(raw_bbox) == 4 and (raw_bbox[2] > raw_bbox[0]) and (raw_bbox[3] > raw_bbox[1]):
+                if max(raw_bbox) > max(pw, ph):
+                    bbox = [
+                        round(raw_bbox[0] * pw / 1000.0, 2),
+                        round(raw_bbox[1] * ph / 1000.0, 2),
+                        round(raw_bbox[2] * pw / 1000.0, 2),
+                        round(raw_bbox[3] * ph / 1000.0, 2),
+                    ]
+                else:
+                    bbox = [round(float(x), 2) for x in raw_bbox]
+            else:
+                bbox = None
+
+            # 识别插图内部误识别的图表坐标轴与 OCR 噪点
+            if self._is_figure_chart_noise(text, bbox, pno):
+                blocks.append(DocumentBlock(
+                    id=f"p{pno}_b{idx}",
+                    type=BlockType.RAW,
+                    original_text=text,
+                    page_num=pno,
+                    bbox=bbox,
+                    page_width=pw,
+                    page_height=ph,
+                    skip_pdf_overlay=True,
+                    metadata={"is_figure_noise": True, "skip_translation": True}
+                ))
+                continue
+
+            # 侧边栏/页边元数据识别与原生保留
+            if bbox and self._is_sidebar_or_margin_metadata(item, text, bbox, pno, pw, ph):
+                blocks.append(DocumentBlock(
+                    id=f"p{pno}_b{idx}",
+                    type=BlockType.RAW,
+                    original_text=text,
+                    page_num=pno,
+                    bbox=bbox,
+                    page_width=pw,
+                    page_height=ph,
+                    skip_pdf_overlay=True,
+                    metadata={"is_sidebar": True, "skip_translation": True}
+                ))
+                continue
+
+            # 标题与参考文献节状态流转判定
+            text_lvl = item.get("text_level", 0)
+            is_title_or_hdr = (m_type == "title") or (text_lvl > 0)
+            clean_txt = re.sub(r"^#{1,6}\s*", "", text).strip()
+
+            is_ref_heading = False
+            if is_title_or_hdr or len(clean_txt) <= 40:
+                if re.match(r"^(References|Bibliography)(\s+(and\s+Notes|cited|and\s+citations))?[:.]?$", clean_txt, re.IGNORECASE):
+                    is_ref_heading = True
+                elif re.match(r"^(\d+\.?\s*)?(References|Bibliography)\b", clean_txt, re.IGNORECASE) and not clean_txt.endswith(".") and not clean_txt.endswith("."): 
+                    is_ref_heading = True
+
+            if is_ref_heading:
+                in_references_section = True
+            elif in_references_section:
+                is_post_ref = bool(re.match(
+                    r"^(\*\*|#*\s*)?(Methods|Online Methods|Ethics statement|Acknowledgements?|Author contributions?|Funding|Competing interests?|Additional information|Supplementary information|Supplementary Materials|Supplementary Text|Extended Data\s+Fig|Extended Data\s+Figure|Publisher[’']?s note|Open Access|Data availability|Code availability|Peer review information|Correspondence|Reprints and permissions)\b",
+                    clean_txt,
+                    re.IGNORECASE
+                ))
+                if is_post_ref:
+                    in_references_section = False
+
+            if is_ref_heading:
+                blocks.append(DocumentBlock(
+                    id=f"p{pno}_b{idx}",
+                    type=BlockType.HEADER_1,
+                    original_text=f"## {clean_txt}",
+                    level=2,
+                    page_num=pno,
+                    bbox=bbox,
+                    page_width=pw,
+                    page_height=ph,
+                    is_bold=True,
+                    skip_pdf_overlay=False
+                ))
+                continue
+
+            if in_references_section:
+                raw_split = re.split(r"\n(?=\s*(?:\[\d+\]|\d+\.\s*|\d+	))", text)
+                for s_i, s_ref in enumerate(raw_split):
+                    s_ref_clean = s_ref.strip()
+                    if not s_ref_clean:
+                        continue
+                    blocks.append(DocumentBlock(
+                        id=f"p{pno}_b{idx}_s{s_i}",
+                        type=BlockType.REFERENCE,
+                        original_text=s_ref_clean,
                         page_num=pno,
                         bbox=bbox,
                         page_width=pw,
                         page_height=ph,
-                        font_size=9.5,
-                        align="center"
+                        skip_pdf_overlay=True,
+                        metadata={"is_reference": True, "skip_translation": True}
                     ))
-                continue
-
-            if not text:
                 continue
 
             b_type = BlockType.PARAGRAPH
             level = 0
             skip_overlay = False
-            if m_type == "title":
-                level = item.get("text_level", 1)
-                b_type = BlockType.TITLE if (pno == 0 and idx == 0) else (
-                    BlockType.HEADER_1 if level == 1 else (BlockType.HEADER_2 if level == 2 else BlockType.HEADER_3)
-                )
-            elif m_type == "interline_equation":
+            if is_title_or_hdr:
+                if pno == 0 and not found_first_title:
+                    b_type = BlockType.TITLE
+                    level = 1
+                    found_first_title = True
+                elif text_lvl == 1 or m_type == "title":
+                    b_type = BlockType.HEADER_1
+                    level = 2
+                elif text_lvl == 2:
+                    b_type = BlockType.HEADER_2
+                    level = 3
+                else:
+                    b_type = BlockType.HEADER_3
+                    level = 4
+            elif m_type == "interline_equation" or (text.startswith("$$") and text.endswith("$$")):
                 b_type = BlockType.MATH_BLOCK
                 skip_overlay = True
             elif m_type == "table":
@@ -258,6 +871,15 @@ class MinerUEngine:
             ))
 
         doc.close()
+        # 1. 段内多行合并与断词清洗 (若处于 reorganize 重新整理模式)
+        if self.para_format == "reorganize":
+            blocks = self._merge_paragraph_lines(blocks)
+
+        # 2. 跨页断词缝合、语义检查与浮动图表重新排序
+        blocks = self._stitch_and_reorder_cross_page_blocks(blocks)
+
+        # 3. 重新同步全文 source markdown
+        full_md = self.blocks_to_source_markdown(blocks)
         return full_md, blocks, mineru_dir
 
     # =========================================================================
@@ -420,12 +1042,23 @@ class MinerUEngine:
                     elif bbox[0] >= col_split_x - 6.0:
                         col_type = "right"
 
+                # 精准检测参考文献节（References / Bibliography）大标题，防止正文普通长句（如 references with a higher-fidelity...）误触
                 mb_preview = self._preview_plain_text(mb).strip()
-                if re.match(r"^#*\s*(References|Bibliography)\b", mb_preview, re.IGNORECASE):
+                clean_preview = re.sub(r"^#{1,6}\s*", "", mb_preview).strip()
+                is_ref_heading = False
+                if len(clean_preview) <= 40:
+                    if re.match(r"^(References|Bibliography)(\s+(and\s+Notes|cited|and\s+citations))?[:.]?$", clean_preview, re.IGNORECASE):
+                        is_ref_heading = True
+                    elif re.match(r"^(\d+\.?\s*)?(References|Bibliography)\b", clean_preview, re.IGNORECASE) and not clean_preview.endswith("."):
+                        is_ref_heading = True
+                elif re.match(r"^#{1,4}\s*(References|Bibliography)\b", mb_preview, re.IGNORECASE) and len(clean_preview) <= 50:
+                    is_ref_heading = True
+
+                if is_ref_heading:
                     in_references_section = True
                 elif in_references_section:
                     is_post_ref = bool(re.match(
-                        r"^(\*\*|#*\s*)?(Methods|Online Methods|Ethics statement|Acknowledgements|Author contributions|Funding|Competing interests|Additional information|Supplementary information|Extended Data\s+Fig|Extended Data\s+Figure|Publisher’s note|Open Access|Data availability|Code availability)\b",
+                        r"^(\*\*|#*\s*)?(Methods|Online Methods|Ethics statement|Acknowledgements|Author contributions|Funding|Competing interests|Additional information|Supplementary information|Supplementary Materials|Supplementary Text|Extended Data\s+Fig|Extended Data\s+Figure|Publisher’s note|Open Access|Data availability|Code availability)\b",
                         mb_preview,
                         re.IGNORECASE
                     ))
@@ -438,7 +1071,7 @@ class MinerUEngine:
                     continue
 
                 b_type: BlockType = reconstructed["type"]
-                if re.match(r"^#*\s*(References|Bibliography)\b", text, re.IGNORECASE):
+                if is_ref_heading:
                     b_type = BlockType.HEADER_1
 
                 block_obj = DocumentBlock(
@@ -481,6 +1114,9 @@ class MinerUEngine:
 
         doc.close()
 
+        # 1. 跨页断词缝合、语义检查与浮动图表重新排序
+        all_blocks = self._stitch_and_reorder_cross_page_blocks(all_blocks)
+
         # 5. Generate full Markdown (full.md) and content_list.json
         full_md = self.blocks_to_source_markdown(all_blocks)
         (mineru_dir / "full.md").write_text(full_md, encoding="utf-8")
@@ -521,11 +1157,11 @@ class MinerUEngine:
 
     def _split_raw_block_if_needed(self, block: Dict[str, Any], pno: int) -> List[Dict[str, Any]]:
         """
-        Decouples single raw_blocks merged by underlying PDF engine:
-        1. Font size disparity between author affiliations (<=9.5pt) and body text (>=10.5pt);
-        2. Structured abstract subsection titles (Background, Methods, Results, Conclusions, etc.);
-        3. Large vertical line gaps (v_gap > 11pt) separating distinct paragraphs;
-        4. Footnote indicators (* equal contribution, NOTE:, etc.).
+        对底层 PDF 引擎粗暴合并的单个 raw_block 进行几何与语义解耦：
+        1. 首页作者与机构小字号 (<=9.5pt) 与正文/摘要首段 (>=10.5pt) 之间的字号跳变截断；
+        2. 结构化摘要小节标题（Background, Methods, Results, Conclusions, Objective 等）；
+        3. 块内间隙过大垂直裂隙 (v_gap > 11pt) 的多段切分；
+        4. 脚注标识（* equal contribution, NOTE: 等）。
         """
         lines = block.get("lines", [])
         if len(lines) <= 1:
@@ -638,7 +1274,7 @@ class MinerUEngine:
         return sub_blocks
 
     def _is_author_area_block(self, block: Dict[str, Any], pno: int) -> bool:
-        """Determines whether block belongs to first-page author/affiliation info (between Title and Abstract)"""
+        """判断是否为首页作者/机构信息块（位于主标题与摘要之间）"""
         if pno != 0:
             return False
         txt = self._preview_plain_text(block).strip()
@@ -672,7 +1308,7 @@ class MinerUEngine:
         return False
 
     def _is_real_table(self, table: Any, page: pymupdf.Page, pno: int) -> bool:
-        """Filters false positives where PyMuPDF misclassifies abstract boxes as tables"""
+        """过滤由摘要或元数据误识别出的伪表格"""
         if pno == 0 and table.bbox[1] < 550.0:
             return False
         if table.row_count < 2 or table.col_count < 2:
@@ -691,7 +1327,7 @@ class MinerUEngine:
         pno: int,
         table_bboxes: Optional[List[pymupdf.Rect]] = None
     ) -> bool:
-        """Determines whether block is a table cell grid block"""
+        """判断是否为表格内部网格块"""
         txt = self._preview_plain_text(block).strip()
         # Captions and notes must remain independent for translation and not absorbed into table cells
         if re.match(r"^(Table|Figure|Fig\.|Extended Data Fig\.)\s*\d+\s*[:.|]", txt, re.IGNORECASE):
@@ -707,11 +1343,15 @@ class MinerUEngine:
         return False
 
     def _is_math_candidate(self, txt: str, bbox: List[float]) -> bool:
-        """Determines whether block is a display formula or equation fragment"""
+        """判断是否为独立数学公式或公式片段"""
         txt_s = txt.strip()
         if not txt_s:
             return False
         x0, y0, x1, y1 = bbox
+
+        # Exclude citation stamps, arxiv ids, and URLs from display math
+        if any(k in txt_s.lower() for k in ("arxiv", "biorxiv", "medrxiv", "doi.org", "doi:", "preprint", "http://", "https://")):
+            return False
 
         # Headings, captions, structured abstract labels, and references are never display math blocks
         if re.match(r"^(Figure|Fig\.|Table|Extended Data|Abstract|Background|Methods|Results|Conclusions|Objective|Findings|Interpretation|References|Acknowledgements|Funding|Author|Competing)\b", txt_s, re.IGNORECASE):
@@ -751,7 +1391,13 @@ class MinerUEngine:
             w.lower() for w in clean_words
             if w.lower() not in math_function_words and not any(w.lower().endswith(fn) for fn in ("exp", "max", "min", "opt"))
         ]
-        if len(content_words) >= 4 or len(clean_words) >= 12:
+        # Exclude citations with publication years (e.g. 2023) or reference pages from being false math blocks
+        if re.search(r"\b(19|20)\d{2}\b", txt_s) and any(w in txt_s.lower() for w in ("vol", "pp.", "page", "ieee", "robot", "trans", "proc", "conf")):
+            return False
+        if re.search(r"\((19|20)\d{2}\)", txt_s):
+            return False
+
+        if len(content_words) > 5 or len(clean_words) >= 14:
             return False
 
         all_greek = set("αβγδεζηθικλμνξοπρστυφχψωΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ")
@@ -995,6 +1641,20 @@ class MinerUEngine:
             return "right"
         return "span"
 
+    @staticmethod
+    def _sort_line_fragments(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按自然阅读顺序排序文本块：垂直重叠>=45%视为同处一行按 x0 从左向右排，否则按 y0 从上向下排"""
+        import functools
+        def _cmp(b1, b2):
+            y0_1, y1_1 = b1["bbox"][1], b1["bbox"][3]
+            y0_2, y1_2 = b2["bbox"][1], b2["bbox"][3]
+            overlap = max(0.0, min(y1_1, y1_2) - max(y0_1, y0_2))
+            min_h = max(1.0, min(y1_1 - y0_1, y1_2 - y0_2))
+            if (overlap / min_h) >= 0.45:
+                return -1 if b1["bbox"][0] < b2["bbox"][0] else (1 if b1["bbox"][0] > b2["bbox"][0] else 0)
+            return -1 if y0_1 < y0_2 else (1 if y0_1 > y0_2 else 0)
+        return sorted(blocks, key=functools.cmp_to_key(_cmp))
+
     def _sort_blocks_by_reading_order(
         self,
         text_blocks: List[Dict[str, Any]],
@@ -1005,7 +1665,7 @@ class MinerUEngine:
     ) -> List[Dict[str, Any]]:
         """
         Sorts blocks into natural human reading order:
-        - Single-column: strictly top-to-bottom (y0 ascending).
+        - Single-column: strictly top-to-bottom (y0 ascending), left-to-right on same line.
         - Two-column:
           1. Top full-width banner (Header / Title / Authors / Abstract)
           2. Left column top-to-bottom
@@ -1013,7 +1673,7 @@ class MinerUEngine:
           4. Bottom full-width banner (Footnotes / Footer)
         """
         if not is_two_col or not text_blocks:
-            return sorted(text_blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            return self._sort_line_fragments(text_blocks)
 
         left_blocks: List[Dict[str, Any]] = []
         right_blocks: List[Dict[str, Any]] = []
@@ -1029,7 +1689,7 @@ class MinerUEngine:
                 other_blocks.append(b)
 
         if not left_blocks and not right_blocks:
-            return sorted(text_blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            return self._sort_line_fragments(text_blocks)
 
         two_col_y_min = min(b["bbox"][1] for b in (left_blocks + right_blocks))
         two_col_y_max = max(b["bbox"][3] for b in (left_blocks + right_blocks))
@@ -1047,11 +1707,11 @@ class MinerUEngine:
             else:
                 mid_span.append(b)
 
-        top_banner.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
-        left_blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
-        right_blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
-        bottom_banner.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
-        mid_span.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+        top_banner = self._sort_line_fragments(top_banner)
+        left_blocks = self._sort_line_fragments(left_blocks)
+        right_blocks = self._sort_line_fragments(right_blocks)
+        bottom_banner = self._sort_line_fragments(bottom_banner)
+        mid_span = self._sort_line_fragments(mid_span)
 
         # Match captions spanning across two columns (e.g. left: Fig. 2 | ... right: field and strength of alignment...)
         # Place right caption continuation immediately after left caption
@@ -1123,26 +1783,85 @@ class MinerUEngine:
         table_bboxes: Optional[List[pymupdf.Rect]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Merges adjacent blocks fragmented by math, scripts, or hanging indents into semantic blocks:
-        1. Vertically overlapping fragments within the same paragraph (y0 < prev_y1 - 0.5).
-        2. Consecutive lines fragmented by subscript line spacing (gap < 3.2pt, unended sentence).
-        3. Reference entries split across lines with hanging indentation.
+        高鲁棒性两阶段块缝合与合并引擎：
+        阶段一：同一水平视觉行内的多字体/公式片段水平缝合（如连字符、行内公式、括号符号）；
+        阶段二：跨行段落合并与参考文献条目聚合，彻底消除单行断词（indi-、Train-）并完整封装文献条目。
         """
         if not blocks:
             return []
 
+        # =========================================================================
+        # 阶段一：同一视觉行水平碎片缝合 (Horizontal Same-Line Stitching)
+        # =========================================================================
+        stitched_lines: List[Dict[str, Any]] = []
+        for b in blocks:
+            txt = self._preview_plain_text(b).strip()
+            if not txt:
+                continue
+            if not stitched_lines:
+                stitched_lines.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+                continue
+            prev = stitched_lines[-1]
+            px0, py0, px1, py1 = prev["bbox"]
+            bx0, by0, bx1, by1 = b["bbox"]
+
+            # 跨栏判断
+            if is_two_col:
+                prev_col = self._get_block_column(prev, col_split_x)
+                curr_col = self._get_block_column(b, col_split_x)
+                if prev_col != curr_col:
+                    stitched_lines.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+                    continue
+
+            # 作者栏与表格格子独立保护
+            if self._is_author_area_block(prev, pno) or self._is_author_area_block(b, pno):
+                if self._is_author_area_block(prev, pno) and self._is_author_area_block(b, pno) and abs(by0 - py0) < 4.0:
+                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
+                    prev["lines"].extend(b.get("lines", []))
+                    continue
+                stitched_lines.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+                continue
+
+            if self._is_table_grid_block(prev, pno, table_bboxes) or self._is_table_grid_block(b, pno, table_bboxes):
+                stitched_lines.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+                continue
+
+            y_overlap = max(0.0, min(py1, by1) - max(py0, by0))
+            min_h = max(1.0, min(py1 - py0, by1 - by0))
+            is_same_line = (y_overlap / min_h) >= 0.45 or (abs(by0 - py0) < 3.5 and abs(by1 - py1) < 3.5)
+            is_wide_gap = (bx0 - px1) > 60.0 and by1 < 100.0
+
+            if is_same_line and not is_wide_gap and bx0 >= px0 - 4.0:
+                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
+                prev["lines"].extend(b.get("lines", []))
+            else:
+                stitched_lines.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+
+        # =========================================================================
+        # 阶段二：垂直段落与参考文献合并 (Vertical Paragraph & Reference Merging)
+        # =========================================================================
         merged: List[Dict[str, Any]] = []
         in_refs = in_refs_start
 
-        for b in blocks:
-            txt = self._preview_plain_text(b)
+        for sl in stitched_lines:
+            txt = self._preview_plain_text(sl).strip()
             if not txt:
                 continue
-            if re.match(r"^#*\s*(References|Bibliography)\b", txt, re.IGNORECASE):
+
+            # 参考文献大标题与后置段落检测
+            clean_txt = re.sub(r"^#{1,6}\s*", "", txt).strip()
+            is_ref_heading = False
+            if len(clean_txt) <= 40:
+                if re.match(r"^(References|Bibliography)(\s+(and\s+Notes|cited|and\s+citations))?[:.]?$", clean_txt, re.IGNORECASE):
+                    is_ref_heading = True
+                elif re.match(r"^(\d+\.?\s*)?(References|Bibliography)\b", clean_txt, re.IGNORECASE) and not clean_txt.endswith("."):
+                    is_ref_heading = True
+
+            if is_ref_heading:
                 in_refs = True
             elif in_refs:
                 is_post_ref = bool(re.match(
-                    r"^(\*\*|#*\s*)?(Methods|Online Methods|Ethics statement|Acknowledgements|Author contributions|Funding|Competing interests|Additional information|Supplementary information|Extended Data\s+Fig|Extended Data\s+Figure|Publisher’s note|Open Access|Data availability|Code availability)\b",
+                    r"^(\*\*|#*\s*)?(Methods|Online Methods|Ethics statement|Acknowledgements|Author contributions|Funding|Competing interests|Additional information|Supplementary information|Supplementary Materials|Supplementary Text|Extended Data\s+Fig|Extended Data\s+Figure|Publisher’s note|Open Access|Data availability|Code availability)\b",
                     txt,
                     re.IGNORECASE
                 ))
@@ -1150,161 +1869,163 @@ class MinerUEngine:
                     in_refs = False
 
             if not merged:
-                merged.append({
-                    "bbox": list(b["bbox"]),
-                    "lines": list(b.get("lines", []))
-                })
+                merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
                 continue
 
             prev = merged[-1]
-            prev_txt = self._preview_plain_text(prev)
+            prev_txt = self._preview_plain_text(prev).strip()
             px0, py0, px1, py1 = prev["bbox"]
-            bx0, by0, bx1, by1 = b["bbox"]
+            bx0, by0, bx1, by1 = sl["bbox"]
             v_gap = by0 - py1
 
-            # Reference section header and reference entries isolation rules:
-            is_ref_hdr = bool(re.match(r"^#*\s*(References|Bibliography)\b", txt, re.IGNORECASE))
-            is_prev_ref_hdr = bool(re.match(r"^#*\s*(References|Bibliography)\b", prev_txt, re.IGNORECASE))
-            is_cite_start = bool(re.match(r"^(\[\d+\]|\d+\.\s*|\d+\t|\d+\.$)", txt))
-            is_prev_cite_start = bool(re.match(r"^(\[\d+\]|\d+\.\s*|\d+\t|\d+\.$)", prev_txt))
-
-            # Reference header is never merged with reference entries
-            if is_ref_hdr or is_prev_ref_hdr:
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # New reference entry in references section is never merged with preceding entry
-            if in_refs and is_cite_start:
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # Author grid and table cells retain independent coordinates and never merge across columns
-            if self._is_author_area_block(prev, pno) or self._is_author_area_block(b, pno):
-                if self._is_author_area_block(prev, pno) and self._is_author_area_block(b, pno) and v_gap < 5.0:
-                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                    prev["lines"].extend(b.get("lines", []))
-                    continue
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-            if self._is_table_grid_block(prev, pno, table_bboxes) or self._is_table_grid_block(b, pno, table_bboxes):
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # Title merging: merge adjacent large title lines (sz >= 15.0, v_gap < 15.0) into a single title block
-            prev_sz = max([s.get("size", 10.0) for l in prev.get("lines", []) for s in l.get("spans", [])] or [10.0])
-            curr_sz = max([s.get("size", 10.0) for l in b.get("lines", []) for s in l.get("spans", [])] or [10.0])
-            if pno == 0 and prev_sz >= 15.0 and curr_sz >= 15.0 and v_gap < 15.0:
-                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
-                continue
-
-            # Never merge across major font size disparities (e.g. Title >= 15pt vs Body <= 12pt)
-            if max(prev_sz, curr_sz) >= 14.5 and abs(prev_sz - curr_sz) >= 3.0:
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # Structured abstract subsections or headings are never merged with preceding paragraphs
-            if re.match(r"^(Background|Methods|Results|Conclusions|Objective|Findings|Interpretation|Abstract)\b", txt, re.IGNORECASE):
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-            if re.match(r"^(\d+(\.\d+)*)\s+([A-Z][a-z]{2,})", txt) and len(txt) < 80:
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # Two-column restriction: only merge fragments within the same column; never merge across columns
+            # 跨栏限制
             if is_two_col:
                 prev_col = self._get_block_column(prev, col_split_x)
-                curr_col = self._get_block_column(b, col_split_x)
+                curr_col = self._get_block_column(sl, col_split_x)
                 if prev_col != curr_col:
-                    merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
+                    merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
                     continue
 
-            bw = bx1 - bx0
-            bh = by1 - by0
-            y_overlap = max(0.0, min(py1, by1) - max(py0, by0))
-            min_h = max(1.0, min(py1 - py0, bh))
-            is_same_visual_line = (y_overlap / min_h) >= 0.5
-            is_vertically_contained = (by0 >= py0 - 3.0 and by1 <= py1 + 3.0)
+            # 1. 参考文献节独立处理：每个条目完整封装
+            is_prev_ref_hdr = bool(re.match(r"^#*\s*(References|Bibliography)\b", prev_txt, re.IGNORECASE) and len(prev_txt) < 35)
+            is_curr_new_cit = bool(re.match(r"^(\[\d+\]|\d+\.\s*|\d+\t|\d+\.$)", txt))
 
+            if is_ref_heading or is_prev_ref_hdr:
+                merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
+                continue
+
+            if in_refs:
+                if is_curr_new_cit:
+                    # 新参考文献条目独立成块
+                    merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
+                    continue
+                elif 0.0 <= v_gap <= 15.0 or v_gap < 0.0:
+                    # 参考文献条目续行平滑吸收
+                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
+                    prev["lines"].extend(sl.get("lines", []))
+                    continue
+
+            # 2. 大标题合并 (Page 0, font >= 15.0)
+            prev_sz = max([s.get("size", 10.0) for l in prev.get("lines", []) for s in l.get("spans", [])] or [10.0])
+            curr_sz = max([s.get("size", 10.0) for l in sl.get("lines", []) for s in l.get("spans", [])] or [10.0])
+            if pno == 0 and prev_sz >= 15.0 and curr_sz >= 15.0 and v_gap < 15.0:
+                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
+                prev["lines"].extend(sl.get("lines", []))
+                continue
+
+            # 3. 独立数学公式判断与隔离
             prev_is_math = self._is_math_candidate(prev_txt, prev["bbox"])
-            curr_is_math = self._is_math_candidate(txt, b["bbox"])
+            curr_is_math = self._is_math_candidate(txt, sl["bbox"])
 
-            # Core A: Same-line formula stitching (e.g. fE = k0 with /2 ... (3), or fS = w with (4))
-            if is_same_visual_line and (prev_is_math or curr_is_math) and (
-                "=" in prev_txt or "=" in txt or re.search(r"\(\d+[a-z]?\)", txt)
-            ):
+            if prev_is_math and curr_is_math and (v_gap < 18.0 or v_gap < 0.0):
                 prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
+                prev["lines"].extend(sl.get("lines", []))
                 continue
 
-            # Core B: Two adjacent display math blocks merging vertically (multi-line brace systems, piecewise functions)
-            if prev_is_math and curr_is_math and (v_gap < 20.0 or is_vertically_contained or y_overlap > 0.0):
+            if prev_is_math or curr_is_math:
+                merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
+                continue
+
+            # 4. 章节标题、图表题注、结构化摘要小节标题隔离
+            is_curr_heading = bool(
+                re.match(r"^(\d+(\.\d+)*)\s+[A-Z]", txt) and len(txt) < 80
+                or re.match(r"^(Background|Methods|Results|Conclusions|Objective|Findings|Interpretation|Abstract)\b", txt, re.IGNORECASE)
+                or re.match(r"^(Figure|Fig\.|Extended Data Fig\.|Table)\s*\d+\s*[:.|]", txt, re.IGNORECASE)
+            )
+            is_prev_heading = bool(
+                re.match(r"^(\d+(\.\d+)*)\s+[A-Z]", prev_txt) and len(prev_txt) < 80
+                or re.match(r"^(Background|Methods|Results|Conclusions|Objective|Findings|Interpretation|Abstract)\b", prev_txt, re.IGNORECASE)
+                or re.match(r"^(Figure|Fig\.|Extended Data Fig\.|Table)\s*\d+\s*[:.|]", prev_txt, re.IGNORECASE)
+            )
+            if is_curr_heading or is_prev_heading:
+                merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
+                continue
+
+            # 5. 正文段落自然合并逻辑 (Paragraph Flow Merging)
+            col_right_edge = (col_split_x - 10.0) if is_two_col and px1 < col_split_x else (pw - 60.0)
+            is_prev_terminal = prev_txt.endswith((".", "!", "?"))
+            is_prev_short = px1 < (col_right_edge - 35.0)
+            is_curr_indented = (bx0 > px0 + 10.0)
+
+            is_para_break = (
+                v_gap > 14.5
+                or (is_prev_terminal and (is_prev_short or is_curr_indented))
+            )
+
+            if not is_para_break and 0.0 <= v_gap <= 14.5:
                 prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
-                continue
-
-            # Core C: Preceding block is formula and current block is formula subline/denominator fragment
-            if prev_is_math and not curr_is_math and (v_gap < 14.0 or v_gap < 0.0 or is_vertically_contained):
-                words = re.findall(r"[a-zA-Z]{2,}", txt)
-                common_prose = {"the", "of", "and", "in", "to", "is", "that", "for", "with", "we", "this", "our"}
-                has_prose_lead = bool(re.match(r"^(The|We|In|Here|This|Where|When|While|Note|Thus|Hence|For)\b", txt.strip()))
-                if not any(w.lower() in common_prose for w in words) and not has_prose_lead:
-                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                    prev["lines"].extend(b.get("lines", []))
-                    continue
-
-            # Core D1: Preceding block is body prose and current block is vertically contained without equation number
-            # Inline symbol, fraction, or script detached by PyMuPDF
-            if not prev_is_math and not re.search(r"\(\d+[a-z]?\)", txt) and is_vertically_contained:
-                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
-                continue
-
-            # Core D2: Preceding block is body prose and current block is tiny script/break fragment
-            if not prev_is_math and not re.search(r"\(\d+[a-z]?\)", txt) and bw < 60.0:
-                if (v_gap <= 3.5 or v_gap < 0.0) and abs(by0 - py1) < 16.0:
-                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                    prev["lines"].extend(b.get("lines", []))
-                    continue
-
-            # Strictly isolate unmerged math formulas from body prose
-            if prev_is_math != curr_is_math:
-                merged.append({"bbox": list(b["bbox"]), "lines": list(b.get("lines", []))})
-                continue
-
-            # Case A: Vertically overlapping or same-line fragments
-            # Exclude side-by-side subfigure titles separated horizontally by > 60pt
-            is_side_by_side_labels = (abs(by0 - py0) < 3.0 and (bx0 - px1) > 60.0 and by1 < 100.0)
-            if v_gap <= 0.5 and not is_side_by_side_labels and not (in_refs and (is_cite_start or is_ref_hdr)):
-                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
-                continue
-
-            # Case C: Reference entry [n] or n. continuation lines (DOI, URL, wrapped text)
-            if in_refs and is_prev_cite_start and not is_cite_start:
-                if 0.0 <= v_gap <= 8.0 or v_gap < 0.0:
-                    prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                    prev["lines"].extend(b.get("lines", []))
-                    continue
-
-            # Case D: Body paragraph broken across lines by subscript spacing (v_gap < 3.2pt)
-            if (
-                not in_refs
-                and 0.0 <= v_gap <= 3.2
-                and abs(px0 - bx0) < 4.0
-                and (px1 - px0) > (180.0 if is_two_col else 300.0)
-                and not prev_txt.endswith((".", ":", "!", "?"))
-            ):
-                prev["bbox"] = [min(px0, bx0), min(py0, by0), max(px1, bx1), max(py1, by1)]
-                prev["lines"].extend(b.get("lines", []))
-                continue
-
-            merged.append({
-                "bbox": list(b["bbox"]),
-                "lines": list(b.get("lines", []))
-            })
+                prev["lines"].extend(sl.get("lines", []))
+            else:
+                merged.append({"bbox": list(sl["bbox"]), "lines": list(sl.get("lines", []))})
 
         return merged
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """
+        清洗文本：将 TeX 数学字体常见的括号控制字符映射为对应符号，并清除 XML/JSON 不兼容的控制字符。
+        """
+        if not text:
+            return ""
+        char_map = {
+            "\x00": "[",
+            "\x01": "]",
+            "\x02": "[",
+            "\x03": "]",
+            "\x10": "(",
+            "\x11": ")",
+            "\x12": "[",
+            "\x13": "]",
+            "\x14": "{",
+            "\x15": "}",
+        }
+        for k, v in char_map.items():
+            if k in text:
+                text = text.replace(k, v)
+        return re.sub(r"[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]", "", text)
+
+    def _is_sidebar_or_margin_metadata(
+        self,
+        block: Dict[str, Any],
+        plain_text: str,
+        bbox: List[float],
+        pno: int,
+        pw: float,
+        ph: float
+    ) -> bool:
+        """
+        识别论文中的侧边栏、页边注及出版元数据（如 arXiv 纵向标识、Received/Accepted 日期、Open Access、Check for updates 等）。
+        此类非论文正文内容在 PDF 上保持原貌（skip_pdf_overlay=True），在翻译流水线中不翻译。
+        """
+        x0, y0, x1, y1 = bbox
+        txt_s = plain_text.strip()
+        txt_lower = txt_s.lower()
+        bw = x1 - x0
+        bh = y1 - y0
+
+        # 1. 页面极左或极右外边距的纵向/横向预印本或期刊边栏标识 (如 arXiv:2508.08241v4)
+        if x1 <= 48.0 or x0 >= pw - 48.0:
+            if any(wm in txt_lower for wm in ["arxiv", "biorxiv", "medrxiv", "doi.org", "license", "crossmark", "check for updates"]):
+                return True
+            # 纵向排版文本（高度显著大于宽度，如竖排旋转文本）
+            if bh > 2.5 * max(1.0, bw) and (x1 <= 55.0 or x0 >= pw - 55.0):
+                return True
+
+        # 2. 出版与审稿元信息（通常位于首页侧边、页脚或栏目顶端）
+        if re.match(r"^(received|accepted|published online|published|revised)\s*:\s*\d+", txt_lower):
+            return True
+        if re.match(r"^check for updates\b", txt_lower):
+            return True
+        if re.match(r"^(article\s+)?https?://doi\.org/\S+", txt_lower) and len(txt_lower) < 80:
+            return True
+        if "open access this article is licensed under" in txt_lower or "creative commons attribution" in txt_lower:
+            return True
+        if re.match(r"^(nature\s+\w+|science|cell)\s*\|\s*volume\b", txt_lower):
+            return True
+        if txt_lower in ("article", "brief communication", "research article", "review article", "perspective"):
+            return True
+
+        return False
 
     def _reconstruct_block_text_and_style(
         self,
@@ -1361,7 +2082,7 @@ class MinerUEngine:
             if line_str.strip():
                 line_strings.append(line_str.strip())
 
-        # Join multi-line text and remove hyphenation (e.g. convolu- \n tional -> convolutional)
+        # 拼接跨行文本并消除英文连字符断词 (如 convolu- \n tional -> convolutional)
         combined = ""
         for l_str in line_strings:
             if not combined:
@@ -1375,6 +2096,7 @@ class MinerUEngine:
         combined = re.sub(r"</sup>\s*<sup>", "", combined)
         combined = re.sub(r"</sub>\s*<sub>", "", combined)
         combined = re.sub(r"\s{2,}", " ", combined).strip()
+        combined = self._sanitize_text(combined)
 
         # Determine block category and whether to overlay in right-hand PDF
         plain_no_tags = re.sub(r"</?(sup|sub|b|i)>|\*\*", "", combined).strip()
@@ -1391,6 +2113,22 @@ class MinerUEngine:
                 "is_bold": is_dominant_bold,
                 "align": "left",
                 "skip_pdf_overlay": True
+            }
+
+        # 0.5 侧边栏与页边出版元数据（如 arXiv 纵向标识、Received/Accepted 日期、Open Access 等非正文内容）
+        if self._is_sidebar_or_margin_metadata(block, plain_no_tags, bbox, pno, pw, ph):
+            return {
+                "text": combined,
+                "type": BlockType.RAW,
+                "level": 0,
+                "font_size": base_size,
+                "is_bold": False,
+                "align": "left",
+                "skip_pdf_overlay": True,
+                "metadata": {
+                    "is_sidebar": True,
+                    "skip_translation": True
+                }
             }
 
         # 1. Page number block (bottom of page y0 > 738 and numeric only)
@@ -1611,7 +2349,16 @@ class MinerUEngine:
 
         # 9. Reference entries ([1] ... or 1. ...)
         is_new_cit = bool(re.match(r"^(\[\d+\]|\d+\.\s*|\d+\t)", plain_no_tags))
-        if in_references or is_new_cit:
+        is_ref_entry = False
+        if is_new_cit:
+            is_ref_entry = True
+        elif in_references:
+            # 在参考文献节内部的续行或条目：只有显式加粗或全大写简短标题才算新节标题
+            is_heading_like = is_dominant_bold and len(plain_no_tags) < 50 and not plain_no_tags.endswith(".")
+            if not is_heading_like:
+                is_ref_entry = True
+
+        if is_ref_entry:
             formatted_ref = re.sub(r"^(\d+)\.\t\s*", r"\1. ", combined)
             formatted_ref = re.sub(r"^(\d+)\t\s*", r"\1. ", formatted_ref)
             return {
@@ -1851,11 +2598,14 @@ class MinerUEngine:
         for b in blocks:
             if b.type == BlockType.RAW:
                 continue
+            if b.metadata and b.metadata.get("is_continuation"):
+                continue
+            txt = (b.metadata.get("full_combined_text") if b.metadata else None) or b.original_text
             if b.type == BlockType.FOOTNOTE:
-                md_lines.append(f"> {b.original_text}")
+                md_lines.append(f"> {txt}")
             elif b.type == BlockType.IMAGE_CAPTION:
-                md_lines.append(f"*{b.original_text}*")
+                md_lines.append(f"*{txt}*")
             else:
-                md_lines.append(b.original_text)
+                md_lines.append(txt)
             md_lines.append("")
         return "\n".join(md_lines)

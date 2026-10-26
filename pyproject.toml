@@ -1,6 +1,6 @@
 [project]
 name = "pile-translation"
-version = "0.1.0"
+version = "0.2.0"
 description = "Academic Paper Translation Pipeline (MinerU + 1:1 Side-by-Side Bilingual Overlay)"
 readme = "README.md"
 requires-python = ">=3.10"

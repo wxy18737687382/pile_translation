@@ -19,17 +19,20 @@ except ImportError:
 
 class DocumentExporter:
     """
-    Exports aligned DocumentBlocks parsed by MinerU and translated by LLMs into multiple formats:
-    1. Side-by-side dual-column PDF (Left: Original, Right: In-place translated PDF at exact coordinates)
-    2. Single-column translated Chinese PDF
-    3. Interactive side-by-side dual-column HTML viewer with synchronized hover highlights
-    4. Bilingual side-by-side Markdown
-    5. Translated Chinese Markdown
-    6. Formatted Word DOCX documents (bilingual and Chinese-only)
+    负责将经 MinerU 前置解析与大模型翻译对齐后的 DocumentBlock 序列导出为多种格式：
+    1. 原版对照双栏 PDF (Left = 原版 PDF, Right = 相同坐标位置原位替换译文 PDF，完整保留照片位置与页脚角注)
+    2. 原版排版纯中文 PDF (单栏原位替换译文 PDF)
+    3. 原版对照双栏交互 HTML (左边原版 PDF 页面，右边相同坐标位置译文页面 + 悬停同步高亮 + 可切换实时 DOM 文字层)
+    4. 双语交替对照 Markdown (含原位提取插图与角注)
+    5. 原文格式纯中文 Markdown (含原位提取插图与角注)
+    6. 双语对照 Word 文档 (含原位插图与角注)
     """
 
+    def __init__(self, para_format: str = "reorganize"):
+        self.para_format = para_format
+
     # =========================================================================
-    # 1. Core feature: Export side-by-side PDF (_bilingual.pdf) and translated Chinese PDF (_zh.pdf)
+    # 1. 核心功能：导出原版对照双栏 PDF (_bilingual.pdf) 与原位中文 PDF (_zh.pdf)
     # =========================================================================
     def export_pdf_translations(
         self,
@@ -40,10 +43,10 @@ class DocumentExporter:
         page_renders_dir: Optional[Path] = None
     ) -> Tuple[Path, Path]:
         """
-        Generates PDFs based on native PDF bboxes (x0, y0, x1, y1):
-        - zh_pdf_path: Single-column PDF with in-place translated text, preserving figures, formulas, and lines.
-        - dual_pdf_path: Side-by-side dual-column PDF (Left: Original, Right: Translation at exact coordinates).
-        - page_renders_dir: Renders high-resolution page comparisons for the interactive HTML viewer.
+        基于原版 PDF 坐标框 (x0, y0, x1, y1) 生成：
+        - zh_pdf_path: 原位替换中文译文、100%保留插图/独立公式/表格线/角注位置的单栏中文 PDF
+        - dual_pdf_path: 左边是原版 PDF、右边在完全相同位置是已翻译文本的双栏对照 PDF
+        - 若提供 page_renders_dir，同时渲染每页高清对照图供 HTML 原版对照阅读器使用
         """
         orig_doc = pymupdf.open(str(source_pdf_path))
         zh_doc = pymupdf.open(str(source_pdf_path))
@@ -59,7 +62,7 @@ class DocumentExporter:
             bg_page = bg_doc[pno] if bg_doc is not None else None
             p_blocks = blocks_by_page.get(pno, [])
 
-            # Collect horizontal divider lines on this page (header lines, footnote dividers, table rules)
+            # 收集本页上的长水平分割线 y 坐标（如页眉线、页脚角注分割线、表格外框线），以及段落内短小的行内分式/根号横线
             horiz_lines_y: List[float] = []
             short_inline_bars: List[pymupdf.Rect] = []
             for d in zh_page.get_drawings():
@@ -76,11 +79,11 @@ class DocumentExporter:
                 if b.bbox and len(b.bbox) == 4 and not b.skip_pdf_overlay and b.type != BlockType.IMAGE
             ]
 
-            # Step 1: Redact English text blocks on cloned page while preserving all images, vector rules, and table grids
+            # 第一步：在克隆页面上精准擦除待翻译英文块（保留所有照片/位图与外围分割线/表格线）
             overlay_rects: List[pymupdf.Rect] = []
             for b in overlay_blocks:
                 rx0, ry0, rx1, ry1 = b.bbox
-                # Prevent redaction rectangle from clipping into preserved text below (references, figures, formulas)
+                # 严格防止擦除区域 (redact_rect) 侵入下方保留文本的顶部（包括参考文献、图片、公式等）
                 for ob in p_blocks:
                     if ob is b or not ob.bbox or len(ob.bbox) != 4:
                         continue
@@ -89,11 +92,11 @@ class DocumentExporter:
                     if h_overlap > 5.0 and ob_y0 >= ry0 - 1.0 and ob_y0 <= ry1 + 2.0:
                         ry1 = min(ry1, ob_y0 - 0.5)
 
-                # If immediately below footnote divider or title rule, ensure redaction rect does not overlap rule
+                # 若上方紧邻角注分割线或标题横线，确保擦除框不侵入横线
                 for ly in horiz_lines_y:
                     if abs(ry0 - ly) < 3.0:
                         ry0 = max(ry0, ly + 1.0)
-                # If image exists above caption, never invade image bounds
+                # 题注上方如果有图片，绝对不侵入图片区域
                 if b.type == BlockType.IMAGE_CAPTION:
                     ry0 = max(ry0, b.bbox[1])
                 redact_rect = pymupdf.Rect(rx0 - 0.5, ry0 - 0.3, rx1 + 0.5, ry1)
@@ -101,6 +104,16 @@ class DocumentExporter:
                 zh_page.add_redact_annot(redact_rect)
                 if bg_page is not None:
                     bg_page.add_redact_annot(redact_rect)
+
+                if b.metadata and "extra_bboxes" in b.metadata:
+                    for eb in b.metadata["extra_bboxes"]:
+                        if eb and len(eb) == 4:
+                            erx0, ery0, erx1, ery1 = eb
+                            e_rect = pymupdf.Rect(erx0 - 0.5, ery0 - 0.3, erx1 + 0.5, ery1)
+                            overlay_rects.append(e_rect)
+                            zh_page.add_redact_annot(e_rect)
+                            if bg_page is not None:
+                                bg_page.add_redact_annot(e_rect)
 
             zh_page.apply_redactions(
                 images=pymupdf.PDF_REDACT_IMAGE_NONE,
@@ -112,7 +125,7 @@ class DocumentExporter:
                     graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED
                 )
 
-            # Mask residual micro-lines from inline fractions/radicals inside redacted paragraphs
+            # 对残留在已擦除正文段落内部的微小行内分式横线/根号顶线进行白色遮盖
             for sr in short_inline_bars:
                 if any(or_rect.intersects(sr) for or_rect in overlay_rects):
                     pad_r = pymupdf.Rect(sr.x0 - 0.5, sr.y0 - 0.8, sr.x1 + 0.5, sr.y1 + 0.8)
@@ -120,10 +133,10 @@ class DocumentExporter:
                     if bg_page is not None:
                         bg_page.draw_rect(pad_r, color=(1, 1, 1), fill=(1, 1, 1))
 
-            # Determine if page has two-column layout and locate column boundary
+            # 判定当前页是否为双栏排版及分栏线位置
             page_is_two_col, col_split_x = self._detect_page_columns(p_blocks, zh_page.rect)
 
-            # Step 2: Overlay translated Chinese text at exact coordinates (x0, y0, x1, y1)
+            # 第二步：在完全相同的坐标位置 (x0, y0, x1, y1) 原位填入中文译文（轻量高效，零冗余字体开销）
             for idx_b, b in enumerate(overlay_blocks):
                 target_rect = self._compute_safe_target_rect(
                     b, p_blocks, idx_b, zh_page.rect, is_two_col=page_is_two_col, col_split_x=col_split_x
@@ -136,20 +149,20 @@ class DocumentExporter:
                     scale_low=0.1
                 )
 
-        # Save single-column translated PDF with garbage collection and stream compression
+        # 保存单栏原版排版中文 PDF (深度垃圾回收与流压缩，生成极小体积 PDF)
         zh_doc.save(str(zh_pdf_path), garbage=4, deflate=True)
 
-        # Build side-by-side dual PDF (Left: Original, Right: Translation)
+        # 构建左右并排的原版对照双栏 PDF (Left = 原版 PDF, Right = 同位置译文 PDF)
         dual_doc = pymupdf.open()
         for pno in range(len(orig_doc)):
             pw = orig_doc[pno].rect.width
             ph = orig_doc[pno].rect.height
             dual_page = dual_doc.new_page(width=pw * 2.0, height=ph)
-            # Left page: 100% Original PDF
+            # 左半页：100% 原版 PDF
             dual_page.show_pdf_page(pymupdf.Rect(0, 0, pw, ph), orig_doc, pno)
-            # Right page: Translated PDF at matching coordinates
+            # 右半页：相同坐标位置已翻译好的 PDF
             dual_page.show_pdf_page(pymupdf.Rect(pw, 0, pw * 2.0, ph), zh_doc, pno)
-            # Center divider line
+            # 中间分隔细线
             dual_page.draw_line(
                 pymupdf.Point(pw, 0),
                 pymupdf.Point(pw, ph),
@@ -159,7 +172,7 @@ class DocumentExporter:
 
         dual_doc.save(str(dual_pdf_path), garbage=4, deflate=True)
 
-        # Export high-resolution PNGs if page_renders_dir is provided for web viewer
+        # 若需要渲染网页端原版对照图层，导出每页高清 PNG
         if page_renders_dir is not None:
             page_renders_dir.mkdir(parents=True, exist_ok=True)
             render_dpi = 150
@@ -187,7 +200,7 @@ class DocumentExporter:
         blocks: List[DocumentBlock],
         page_rect: pymupdf.Rect
     ) -> Tuple[bool, float]:
-        """Dynamically detects two-column layout status and split-line x coordinate"""
+        """动态检测当前页面的双栏排版状态与分栏线 x 坐标"""
         pw, ph = page_rect.width, page_rect.height
         mid_x = pw / 2.0
         for b in blocks:
@@ -250,18 +263,19 @@ class DocumentExporter:
         col_split_x: float = 300.0
     ) -> pymupdf.Rect:
         """
-        Calculates target bounding box for text overlay:
-        Anchors strictly at original (x0, y0) with column-aware width constraints:
-        - Two-column left: right margin capped at col_split_x - 4.0pt (never overflows to right column).
-        - Two-column right: right margin capped at page margin (pw - 28.0pt).
-        - Single-column / span: right margin set to text boundary (pw - 35.0pt).
-        Bottom bound bounded by subsequent block in same column.
+        计算右页译文回填的目标矩形框：
+        严格锚定原文起点 (x0, y0)，根据是否为双栏排版严格限制横向安全范围：
+        - 双栏排版左栏：右边界硬性截断在 col_split_x - 4.0pt，严禁跨越中线覆写右栏！
+        - 双栏排版右栏：右边界截断在页面右边距 (pw - 28.0pt)。
+        - 单栏排版或跨栏全宽横幅：右边界适度延伸至正文右边距 (505.5pt / pw - 35.0pt)。
+        - 边栏/非对称分栏/左右邻接块：严格受控在右侧邻块边界以左 (min_right_neighbor_x0)，严禁横向穿透覆写相邻块！
+        同时同栏内的下邻块顶部 y0 作为垂直扩展硬上限（跨栏块互不挤压）。
         """
         x0, y0, x1, y1 = block.bbox
         pw, ph = page_rect.width, page_rect.height
         box_h = y1 - y0
 
-        # Determine column assignment for current block
+        # 判断当前块的栏属
         block_col = block.metadata.get("column") if (block.metadata and "column" in block.metadata) else "span"
         if block_col == "span" and is_two_col:
             if x1 <= col_split_x + 6.0:
@@ -269,18 +283,39 @@ class DocumentExporter:
             elif x0 >= col_split_x - 6.0:
                 block_col = "right"
 
-        # Determine right margin constraint
-        if is_two_col and block_col == "left":
-            # Left column: right margin constrained left of column divider with >= 4pt gutter
-            right_margin = min(col_split_x - 4.0, max(x1, x0 + 80.0))
-        elif is_two_col and block_col == "right":
-            # Right column: right margin extends to page right margin
-            right_margin = min(pw - 28.0, max(x1, x0 + 80.0))
-        else:
-            # Single-column or full-span banner
-            right_margin = min(pw - 35.0, max(x1, min(pw - 105.0, 505.5)))
+        # 1. 查找当前块右侧是否存在共享垂直区间的相邻块 (无论是否检测为双栏)
+        # 严禁任何块的横向排版扩展侵入其右侧邻块的区域，彻底避免多栏、边栏与主正文互相重叠！
+        min_right_neighbor_x0 = pw - 28.0
+        for ob in page_all_blocks:
+            if ob is block or not ob.bbox or len(ob.bbox) != 4:
+                continue
+            ox0, oy0, ox1, oy1 = ob.bbox
+            # 判定条件：ob 严格位于当前块的右侧 (起点偏右至少 20pt，且起点在当前块右边缘附近或以右)
+            if ox0 >= x0 + 20.0 and ox0 >= x1 - 15.0:
+                # 垂直方向共享区间：两个块在垂直高度上重叠，或 ob 紧随当前块下方附近 (译文换行扩展区)
+                vert_overlap = min(y1, oy1) - max(y0, oy0)
+                if vert_overlap > -8.0 or (oy0 >= y0 and oy0 <= y1 + 15.0):
+                    min_right_neighbor_x0 = min(min_right_neighbor_x0, ox0 - 4.0)
 
-        # Locate top y0 of succeeding block in same column as vertical ceiling
+        # 2. 确定右边界 right_margin
+        orig_w = x1 - x0
+        is_narrow_left = (orig_w < pw * 0.45) and (x1 < pw * 0.55)
+        has_right_neighbor = (min_right_neighbor_x0 < pw - 30.0)
+
+        if is_two_col and block_col == "left":
+            # 左栏：右边界绝对受控在分栏线左侧与右侧邻块左侧，留出至少 4pt 栏隙
+            right_margin = min(col_split_x - 4.0, min_right_neighbor_x0, max(x1, x0 + 80.0))
+        elif is_two_col and block_col == "right":
+            # 右栏：右边界延伸至页面右侧边距
+            right_margin = min(pw - 28.0, min_right_neighbor_x0, max(x1, x0 + 80.0))
+        elif is_narrow_left or has_right_neighbor:
+            # 狭窄边栏块或右侧存在相邻块：严格限制在边栏或右侧邻块以左，严禁向右跨越覆写
+            right_margin = min(min_right_neighbor_x0, max(x1, x0 + 80.0))
+        else:
+            # 单栏或全宽横幅
+            right_margin = min(pw - 35.0, min_right_neighbor_x0, max(x1, min(pw - 105.0, 505.5)))
+
+        # 3. 查找紧随其后的同栏下邻块顶部 y0，作为当前块垂直扩展的硬上限
         next_y0 = ph - 35.0
         for nb in page_all_blocks:
             if nb is block or not nb.bbox or len(nb.bbox) != 4:
@@ -289,7 +324,7 @@ class DocumentExporter:
             if ny0 < y0 + 1.0:
                 continue
 
-            # Determine column assignment for nb
+            # 判断 nb 的栏属
             nb_col = nb.metadata.get("column") if (nb.metadata and "column" in nb.metadata) else "span"
             if nb_col == "span" and is_two_col:
                 if nx1 <= col_split_x + 6.0:
@@ -297,71 +332,130 @@ class DocumentExporter:
                 elif nx0 >= col_split_x - 6.0:
                     nb_col = "right"
 
-            # Column isolation: left blocks are not clipped by right blocks and vice versa
+            # 跨栏互不干扰：左栏段落不被右栏段落垂直截断，反之亦然
             if is_two_col and block_col in ("left", "right") and nb_col in ("left", "right") and block_col != nb_col:
                 continue
 
-            # Check horizontal overlap or same-column alignment
-            if not (nx1 < x0 or nx0 > right_margin):
+            # 检查横向是否有遮挡或同栏重合
+            h_overlap = min(right_margin, nx1) - max(x0, nx0)
+            if h_overlap > 8.0:
                 next_y0 = min(next_y0, ny0 - 1.0)
 
-        # 1. Centered title or heading (e.g. Attention Is All You Need / Abstract)
+        # 1. 居中主标题或居中一级标题 (如 Attention Is All You Need / Abstract)
         if block.align == "center" and block.type in (BlockType.TITLE, BlockType.HEADER_1):
-            if is_two_col and block_col == "left":
+            if (is_two_col and block_col == "left") or is_narrow_left or has_right_neighbor:
                 return pymupdf.Rect(x0, y0 - 1.5, right_margin, min(y1 + 4.0, next_y0))
-            return pymupdf.Rect(max(35.0, x0 - 15.0) if is_two_col else 108.0, y0 - 1.5, min(pw - 35.0, x1 + 15.0) if is_two_col else 504.0, min(y1 + 5.0, next_y0))
+            return pymupdf.Rect(max(35.0, x0 - 15.0) if is_two_col else 108.0, y0 - 1.5, min(right_margin, x1 + 15.0) if is_two_col else min(right_margin, 504.0), min(y1 + 5.0, next_y0))
 
-        # 2. Caption or subfigure title (e.g. Figure 1 / Scaled Dot-Product Attention)
+        # 2. 图表题注或子图居中标题 (如 Figure 1 / Scaled Dot-Product Attention)
         if block.type == BlockType.IMAGE_CAPTION:
             target_y0 = max(y0, block.bbox[1])
             if block.align == "center":
                 cx = (x0 + x1) / 2.0
                 half_w = max((x1 - x0) / 2.0 + 20.0, 70.0)
-                target_x0 = max(x0 - 10.0, cx - half_w) if is_two_col else max(90.0, cx - half_w)
-                target_x1 = min(right_margin, cx + half_w) if is_two_col else min(pw - 90.0, cx + half_w)
+                target_x0 = max(x0 - 10.0, cx - half_w) if (is_two_col or is_narrow_left or has_right_neighbor) else max(90.0, cx - half_w)
+                target_x1 = min(right_margin, cx + half_w)
                 return pymupdf.Rect(target_x0, target_y0, target_x1, min(y1 + 4.0, next_y0))
             return pymupdf.Rect(x0, target_y0, right_margin, min(y1 + 4.0, next_y0))
 
-        # 3. Left-aligned section heading (e.g. 1 Introduction)
+        # 3. 左对齐各级章节标题 (如 1 Introduction, 3.1 Encoder and Decoder Stacks)
         if block.type in (BlockType.HEADER_1, BlockType.HEADER_2, BlockType.HEADER_3):
             return pymupdf.Rect(x0, y0 - 1.5, right_margin, min(y1 + 4.0, next_y0))
 
-        # 4. Single-line short text or footnote
+        # 4. 单行短文本或单行页脚角注 (如 P7 B22 角注5, P0 B18 会议页脚)
         if box_h < 13.5:
             return pymupdf.Rect(x0, y0 - 1.0, right_margin, min(y1 + 3.5, next_y0))
 
-        # 5. Multi-line body paragraph, footnote, list item, or reference entry
+        # 5. 多行正文段落、多行角注、列表项与参考文献条目
         safe_y1 = min(y1 + 3.0, next_y0)
         if safe_y1 <= y0 + 6.0:
             safe_y1 = y1 + 1.0
         return pymupdf.Rect(x0, y0 - 1.0, right_margin, safe_y1)
 
+    @staticmethod
+    def _is_pseudo_formula(math_content: str) -> bool:
+        """
+        判断一个 $...$ 内部的内容是否为“伪公式”（即实质上是学术物理量、带单位数值、温度、度量衡、缩写或符号，
+        由 MinerU OCR 误打包为 LaTeX 行内公式），而非真正的数学等式/代数表达式。
+        """
+        s = math_content.strip()
+        # 含有数学关系符、等号、求和、积分、极限、分式的，属于真实数学公式，保持为公式
+        if any(k in s for k in ["=", "\\sum", "\\int", "\\frac", "\\prod", "\\lim", "\\in", "\\le", "\\ge", "\\leq", "\\geq", "\\neq", "\\approx", "\\propto"]):
+            return False
+        # 含有多字符数学函数的，属于真实公式
+        if re.search(r"\\(?:sin|cos|tan|log|ln|exp|det|max|min)\b", s):
+            return False
+        # 含有花体字母 \mathcal 通常是损失函数或集合，属于真实公式
+        if "\\mathcal" in s or "\\mathbb" in s:
+            return False
+
+        # 匹配单位/物理量/度量衡/温度特征:
+        unit_keywords = (
+            "\\textmu", "μ", "nm", "mm", "cm", "km", "kDa", "Da", "mbar", "bar",
+            "mL", "μL", "nL", "pL", "mg", "kg", "mol", "mmol", "μmol", "nmol",
+            "mW", "kW", "mJ", "kJ", "Pa", "kPa", "MPa", "GPa", "mPas",
+            "circ", "degree", "°", "C", "F", "K", "min", "sec", "h", "s",
+            "cells/mL", "wt", "vol", "%", "pmb", "prime"
+        )
+        if any(uk in s for uk in unit_keywords):
+            return True
+
+        # 匹配纯数字、连字符、范围 (如 500, 1 - 10, 20 - 22)
+        s_clean = re.sub(r"\\[a-zA-Z]+", "", s)
+        s_clean = re.sub(r"[{}_^~ \t\-\+]+", "", s_clean)
+        if s_clean.isdigit():
+            return True
+
+        # 匹配大写英文缩写 (如 DLP, nPVA, ATPS, PDMS, DEX, PEG)
+        if re.match(r"^[A-Za-z0-9\s\-_+()]+$", s_clean) and len(s_clean) <= 10:
+            return True
+
+        return False
+
     def _latex_math_to_rich_html(self, text: str) -> str:
-        """Converts LaTeX inline math and scripts into rich text with <sub> / <sup> tags"""
+        """
+        全面解析与转换 LaTeX 行内公式、数学符号、学术物理量单位及 MinerU OCR 离散空格，
+        将其转化为排版纯净的富文本 (带 <b>, <i>, <sup>, <sub> 标签及标准 Unicode 符号)。
+        具备严格保护机制：绝不破坏任何 {{...}} 占位符及已有 HTML 格式标签。
+        """
         if not text:
             return ""
 
-        # 0. Strip display math double-dollar wrappers
+        # 0. 绝对保护已存在的 {{...}} 占位符与已有 HTML 标签 (如 <sup>, <sub>, <b>, <i>, <span>)
+        # 使用无下划线纯字母数字 token 避免被 subscript/superscript 正则误匹配
+        placeholder_map = {}
+        cnt = 0
+        def _stash_token(m):
+            nonlocal cnt
+            k = f"QQESCTOKEN{cnt}QQ"
+            placeholder_map[k] = m.group(0)
+            cnt += 1
+            return k
+
+        text = re.sub(r"\{\{[A-Za-z0-9_–\-]+\}\}}|</?(?:sup|sub|b|i|span)[^>]*>", _stash_token, text)
+
+        # 1. 移除 display math 双美元符号包裹
         text = re.sub(r"^\$\$\s*|\s*\$\$$", "", text)
 
-        # 1. Font commands: \mathbf, \boldsymbol, \mathit, \mathrm, \text
-        text = re.sub(r"\\mathbf\{([^}]+)\}", r"<b>\1</b>", text)
-        text = re.sub(r"\\boldsymbol\{([^}]+)\}", r"<b>\1</b>", text)
-        text = re.sub(r"\\mathit\{([^}]+)\}", r"<i>\1</i>", text)
-        text = re.sub(r"\\(?:mathrm|text)\{([^}]+)\}", r"\1", text)
+        # 2. 预清洗 LaTeX 环境与尺寸修饰符 (消除 \left, \right, \scriptstyle 等排版杂质)
+        text = re.sub(r"\\(?:left|right)\b", "", text)
+        text = re.sub(r"\\(?:scriptstyle|scriptscriptstyle|textstyle|displaystyle)\b", "", text)
+        text = re.sub(r"\\(?:quad|qquad|enspace)\b", " ", text)
+        text = re.sub(r"\\\s+", " ", text)  # \ 后面跟空格 (如 \ nL -> nL)
+        text = re.sub(r"\\[,;:!]", " ", text)
+        text = text.replace("~", " ")
 
-        # 2. Caligraphic letters (\mathcal{...})
-        cal_map = {
-            "A": "𝒜", "B": "ℬ", "C": "𝒞", "D": "𝒟", "E": "ℰ", "F": "ℱ", "G": "𝒢", "H": "ℋ",
-            "I": "ℐ", "J": "𝒥", "K": "𝒦", "L": "ℒ", "M": "ℳ", "N": "𝒩", "O": "𝒪", "P": "𝒫",
-            "Q": "𝒬", "R": "ℛ", "S": "𝒮", "T": "𝒯", "U": "𝒰", "V": "𝒱", "W": "𝒲", "X": "𝒳",
-            "Y": "𝒴", "Z": "𝒵"
-        }
-        for k, v in cal_map.items():
-            text = text.replace(f"\\mathcal{{{k}}}", v)
+        # 3. 撇号导数与度数符号在先处理
+        text = re.sub(r"\\prime\s*\\prime", "″", text)
+        text = re.sub(r"\\prime", "′", text)
+        text = re.sub(r"\\(?:circ|degree)\b", "°", text)
 
-        # 3. Greek letter replacements
-        greek_map = {
+        # 4. 希腊字母与学术物理量微符号 (\textmu, \mu 等)
+        greek_and_special = {
+            "\\textmu": "μ", "\\textcelsius": "°C", "\\textdegree": "°", "\\textperthousand": "‰",
+            "\\textendash": "–", "\\textemdash": "—", "\\textless": "<", "\\textgreater": ">",
+            "\\textpercent": "%", "\\bullet": "•", "\\circledcirc": "©",
+            "\\hbar": "ℏ", "\\ell": "ℓ", "\\AA": "Å", "\\angstrom": "Å",
             "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\delta": "δ",
             "\\epsilon": "ε", "\\varepsilon": "ε", "\\zeta": "ζ", "\\eta": "η",
             "\\theta": "θ", "\\vartheta": "θ", "\\iota": "ι", "\\kappa": "κ",
@@ -371,49 +465,240 @@ class DocumentExporter:
             "\\phi": "φ", "\\varphi": "φ", "\\chi": "χ", "\\psi": "ψ", "\\omega": "ω",
             "\\Gamma": "Γ", "\\Delta": "Δ", "\\Theta": "Θ", "\\Lambda": "Λ",
             "\\Xi": "Ξ", "\\Pi": "Π", "\\Sigma": "Σ", "\\Upsilon": "Υ",
-            "\\Phi": "Φ", "\\Psi": "Ψ", "\\Omega": "Ω"
+            "\\Phi": "Φ", "\\Psi": "Ψ", "\\Omega": "Ω",
+            "\\varLambda": "Λ", "\\varOmega": "Ω", "\\varPhi": "Φ", "\\varPsi": "Ψ",
+            "\\varSigma": "Σ", "\\varTheta": "Θ", "\\varUpsilon": "Υ", "\\varXi": "Ξ", "\\varPi": "Π"
         }
-        for k, v in greek_map.items():
+        for k, v in greek_and_special.items():
             text = re.sub(re.escape(k) + r"(?![a-zA-Z])", v, text)
 
-        # 4. Mathematical operators and relation symbols
+        # 5. 数学算子与关系符号
         op_map = {
             "\\nabla": "∇", "\\partial": "∂", "\\infty": "∞",
             "\\times": "×", "\\cdot": "·", "\\pm": "±", "\\mp": "∓",
             "\\leq": "≤", "\\le": "≤", "\\geq": "≥", "\\ge": "≥",
             "\\neq": "≠", "\\ne": "≠", "\\approx": "≈", "\\equiv": "≡",
-            "\\sim": "∼", "\\propto": "∝", "\\in": "∈", "\\notin": "∉",
+            "\\sim": "~", "\\propto": "∝", "\\in": "∈", "\\notin": "∉",
             "\\to": "→", "\\rightarrow": "→", "\\leftarrow": "←",
-            "\\sqrt": "√", "\\forall": "∀", "\\exists": "∃"
+            "\\sqrt": "√", "\\forall": "∀", "\\exists": "∃",
+            "\\sum": "∑", "\\prod": "∏", "\\int": "∫"
         }
         for k, v in op_map.items():
             text = re.sub(re.escape(k) + r"(?![a-zA-Z])", v, text)
 
-        # 5. Script conversion
-        # Subscript _{...} or _X
-        text = re.sub(r"_\{([^}]+)\}", r"<sub>\1</sub>", text)
+        # 6. 花体与黑板粗体字母 (\mathcal{...}, \mathbb{...})
+        cal_map = {
+            "A": "𝒜", "B": "ℬ", "C": "𝒞", "D": "𝒟", "E": "ℰ", "F": "ℱ", "G": "𝒢", "H": "ℋ",
+            "I": "ℐ", "J": "𝒥", "K": "𝒦", "L": "ℒ", "M": "ℳ", "N": "𝒩", "O": "𝒪", "P": "𝒫",
+            "Q": "𝒬", "R": "ℛ", "S": "𝒮", "T": "𝒯", "U": "𝒰", "V": "𝒱", "W": "𝒲", "X": "𝒳",
+            "Y": "𝒴", "Z": "𝒵"
+        }
+        for k, v in cal_map.items():
+            text = re.sub(r"\\mathcal\s*\{\s*" + k + r"\s*\}", v, text)
+
+        bb_map = {
+            "R": "ℝ", "C": "ℂ", "N": "ℕ", "Z": "ℤ", "Q": "ℚ", "I": "𝕀"
+        }
+        for k, v in bb_map.items():
+            text = re.sub(r"\\mathbb\s*\{\s*" + k + r"\s*\}", v, text)
+
+        # 7. 字体样式解包 (支持嵌套括号，如 \mathrm{(DLP)^{41,42}})
+        def _unwrap_braced_cmd(s: str, cmd_pattern: str, wrap_tag: str = "") -> str:
+            pattern = re.compile(cmd_pattern + r"\s*\{")
+            while True:
+                m = pattern.search(s)
+                if not m:
+                    break
+                start = m.start()
+                brace_start = m.end() - 1
+                depth = 1
+                idx = brace_start + 1
+                while idx < len(s) and depth > 0:
+                    if s[idx] == '{':
+                        depth += 1
+                    elif s[idx] == '}':
+                        depth -= 1
+                    idx += 1
+                if depth == 0:
+                    inner = s[brace_start + 1:idx - 1]
+                    if wrap_tag:
+                        replacement = f"<{wrap_tag}>{inner}</{wrap_tag}>"
+                    else:
+                        replacement = inner
+                    s = s[:start] + replacement + s[idx:]
+                else:
+                    s = s[:start] + s[brace_start + 1:]
+            return s
+
+        text = _unwrap_braced_cmd(text, r"\\(?:mathbf|boldsymbol|pmb|textbf)", wrap_tag="b")
+        text = _unwrap_braced_cmd(text, r"\\(?:mathit|textit)", wrap_tag="i")
+        text = _unwrap_braced_cmd(text, r"\\(?:mathrm|mathsf|text|textsf|texttt|rm|sf)")
+        text = re.sub(r"\\(?:tt|sf|rm|bf|it)\b", "", text)
+
+        # 8. 上标与下标通用转换
+        # 上标若包含度数、撇号等原生上标符号，直接脱壳
+        text = re.sub(r"\^\s*\{\s*([°′″]+)\s*\}", r"\1", text)
+        text = re.sub(r"\^\s*([°′″])", r"\1", text)
+
+        # 下标 _{...} 或 _X
+        text = re.sub(r"_\s*\{([^}]+)\}", r"<sub>\1</sub>", text)
         text = re.sub(r"_([a-zA-Z0-9α-ωΑ-Ω])", r"<sub>\1</sub>", text)
-        # Superscript ^{...} or ^X
-        text = re.sub(r"\^\{([^}]+)\}", r"<sup>\1</sup>", text)
+        # 上标 ^{...} 或 ^X
+        text = re.sub(r"\^\s*\{([^}]+)\}", r"<sup>\1</sup>", text)
         text = re.sub(r"\^([a-zA-Z0-9α-ωΑ-Ω*†])", r"<sup>\1</sup>", text)
 
-        # 6. Hat and bar symbols
-        text = re.sub(r"\\hat\{([^}]+)\}", r"\1̂", text)
-        text = re.sub(r"\\bar\{([^}]+)\}", r"\1̄", text)
-        text = re.sub(r"\\tilde\{([^}]+)\}", r"\1̃", text)
+        # 9. 常见帽子与横杠符号
+        text = re.sub(r"\\hat\s*\{([^}]+)\}", r"\1̂", text)
+        text = re.sub(r"\\bar\s*\{([^}]+)\}", r"\1̄", text)
+        text = re.sub(r"\\tilde\s*\{([^}]+)\}", r"\1̃", text)
 
-        # 7. Strip surrounding dollar signs: $...$ -> ...
+        # 10. 清洗 OCR 引入的数字与小数点离散空格
+        for _ in range(4):
+            text = re.sub(r"(?<=\d)\s(?=\d)", "", text)
+        text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+
+        # 11. 清洗 MinerU OCR 单词内部被拆开的字母空格 (针对学术缩写及单位)
+        known_acronyms_map = {
+            r"\bn\s+P\s+V(?:\s+A)?\b": "nPVA",
+            r"\bk\s+D\s+a\b": "kDa",
+            r"\bn\s+m\b": "nm",
+            r"\bm\s+b\s+a\s+r\b": "mbar",
+            r"\bm\s+i\s+n\b": "min",
+            r"\bm\s+w\b": "mW",
+            r"\bc\s+m\b": "cm",
+            r"\bμ\s*L\b": "μL",
+            r"\bm\s*L\b": "mL",
+            r"\bn\s*L\b": "nL",
+            r"\bD\s+E\s+X\b": "DEX",
+            r"\bP\s+E\s+G\b": "PEG",
+            r"\bP\s+I\s+P\s+S\b": "PIPS",
+            r"\bA\s+T\s+P\s+S\b": "ATPS",
+            r"\bP\s+D\s+M\s+S\b": "PDMS",
+            r"\bF\s+I\s+T\s+C\b": "FITC",
+            r"\bR\s+G\s+D\b": "RGD",
+        }
+        for pat, rep in known_acronyms_map.items():
+            text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+
+        def _join_spaced_letters(m):
+            raw = m.group(0)
+            letters = raw.split()
+            if 2 <= len(letters) <= 6 and all(len(x) == 1 and x.isalpha() for x in letters):
+                return "".join(letters)
+            return raw
+
+        text = re.sub(r"\b[A-Za-z](?:\s+[A-Za-z])+\b", _join_spaced_letters, text)
+
+        # 12. 清洗冗余孤立的花括号 (注意：严格避开 QQESCTOKEN 或可能存在的双括号)
+        text = re.sub(r"(?<!\{)\{\s*([^{}]+?)\s*\}(?!\})", r"\1", text)
+        text = re.sub(r"(?<!\{)\{\s*([^{}]+?)\s*\}(?!\})", r"\1", text)
+
+        # 13. 清理残留的反斜杠转义符号 (如 \% -> %, \& -> &, \_ -> _)
+        text = re.sub(r"\\([%&_#$])", r"\1", text)
+
+        # 14. 去除两端的美元符号: $...$ -> ...
         text = re.sub(r"\$([^$]+)\$", r"\1", text)
         text = text.replace("$", "")
+
+        # 15. 规范化连字符与减号周围的空格 (如 `500 - μL` -> `500-μL`)
+        text = re.sub(r"(\d+)\s*[-−]\s*([a-zA-Zμ°])", r"\1-\2", text)
+        text = re.sub(r"\bμ\s+([A-Za-z])", r"μ\1", text)  # μ L -> μL, μ m -> μm
+        text = re.sub(r"°\s+([CF])\b", r"°\1", text)        # ° C -> °C
+        text = re.sub(r"(\d+)\s+°C\b", r"\1 °C", text)
+
+        # 规范化 <sup> / <sub> 内部的连字符与空格
+        text = re.sub(r"<sup>\s*-\s*(\d+)\s*</sup>", r"<sup>-\1</sup>", text)
+        text = re.sub(r"<sup>\s*(\d+)\s*,\s*(\d+)\s*</sup>", r"<sup>\1,\2</sup>", text)
+
+        # 16. 消除任何可能遗留的裸 LaTeX 命令反斜杠 (兜底保护，严防 \command 泄露)
+        text = re.sub(r"\\[a-zA-Z]+\b", "", text)
+
+        # 17. 规范化空白字符
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"(<(?:b|i|sup|sub)>)\s+", r"\1", text)
+        text = re.sub(r"\s+(</(?:b|i|sup|sub)>)", r"\1", text)
+
+        # 18. 还原受保护的占位符与 HTML 标签
+        for k, v in placeholder_map.items():
+            text = text.replace(k, v)
+
+        return text.strip()
+
+    def _clean_markdown_text(self, text: str) -> str:
+        r"""
+        清洗 Markdown 文本中的伪公式、LaTeX 泄露与 OCR 空格，使导出的 Markdown 纯净可读且 KaTeX 不报错：
+        1. 伪公式 (如 ${ 5 0 0 } \mathrm { - } \mathrm { \textmu L }$, $4 0 5 \mathsf { n m }$, $3 7 ^ { \circ } \mathsf { C }$) -> 直接解为纯文本/标准 Markdown
+        2. 真实数学公式 (如 $\mathcal{L} = \dots$, $y_{i,j} \in [0, 1]$) -> 保留 $...$，但清洗内部 \textmu -> \mu 与数字间空格
+        3. 裸漏的 LaTeX 代码 (如未加 $ 的 `{ 5 0 0 } \mathrm { - } \mathrm { \textmu L }` 或 `\left( P \right)`) -> 自动清洗为纯文本
+        4. 严格保护任何已有的 {{CITE_...}}, {{MATH_...}}, {{FN_TAG_...}} 占位符不被破坏
+        """
+        if not text:
+            return ""
+
+        # 1. 保护占位符 {{...}}
+        placeholder_map = {}
+        cnt = 0
+        def _stash_ph(m):
+            nonlocal cnt
+            k = f"QQPHSTASH{cnt}QQ"
+            placeholder_map[k] = m.group(0)
+            cnt += 1
+            return k
+
+        text = re.sub(r"\{\{[A-Za-z0-9_–\-]+\}\}}", _stash_ph, text)
+
+        # 2. 处理行内公式 $...$
+        def _handle_math_match(m):
+            raw_inner = m.group(1).strip()
+            if not raw_inner:
+                return ""
+            # 判断是否为伪公式 (带单位的物理量、纯数字、测量值等)
+            if self._is_pseudo_formula(raw_inner):
+                # 转为排版纯文本 (如 500-μL, 405 nm, 37 °C, G′, G″)
+                cleaned = self._latex_math_to_rich_html(raw_inner)
+                # 还原 HTML 上下标标签为 Markdown 友好的纯文本或 Unicode 上标
+                cleaned = cleaned.replace("<b>", "**").replace("</b>", "**")
+                cleaned = cleaned.replace("<i>", "*").replace("</i>", "*")
+                # 简化常见上下标
+                cleaned = re.sub(r"<sup>([0-9\-\+]+)</sup>", lambda sm: "".join({"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹","-":"⁻","+":"⁺"}.get(c, c) for c in sm.group(1)), cleaned)
+                cleaned = re.sub(r"<sub>([0-9]+)</sub>", lambda sm: "".join({"0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉"}.get(c, c) for c in sm.group(1)), cleaned)
+                # 移除残余的 html 标签
+                cleaned = re.sub(r"</?(?:sup|sub)>", "", cleaned)
+                return cleaned
+            else:
+                # 真实公式：保留 $...$，但清洗 KaTeX 致命错误 (\textmu -> \mu, 数字间空格等)
+                clean_math = raw_inner
+                clean_math = clean_math.replace("\\textmu", "\\mu")
+                clean_math = re.sub(r"(?<=\d)\s(?=\d)", "", clean_math)
+                clean_math = re.sub(r"\\mathrm\s*\{\s*-\s*\}", "-", clean_math)
+                clean_math = re.sub(r"\\mathrm\s*\{\s*\+\s*\}", "+", clean_math)
+                return f"${clean_math}$"
+
+        text = re.sub(r"(?<!\\)\$(?!\$)([^\$\n]+?)(?<!\\)\$", _handle_math_match, text)
+
+        # 3. 处理没有用 $ 包裹但裸漏的 LaTeX 代码 (如 `{ 5 0 0 } \mathrm { - } \mathrm { \textmu L }`, `\left( P \right)`)
+        # 只要文本中还残留形如 \mathrm{...}, \mathsf{...}, \textmu, \left(, { 500 } 等
+        if re.search(r"\\(?:mathrm|mathsf|mathbf|boldsymbol|pmb|textmu|left|right)\b", text) or re.search(r"\{\s*\d+\s*\}", text):
+            cleaned_leak = self._latex_math_to_rich_html(text)
+            cleaned_leak = cleaned_leak.replace("<b>", "**").replace("</b>", "**")
+            cleaned_leak = cleaned_leak.replace("<i>", "*").replace("</i>", "*")
+            cleaned_leak = re.sub(r"<sup>([0-9\-\+]+)</sup>", lambda sm: "".join({"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹","-":"⁻","+":"⁺"}.get(c, c) for c in sm.group(1)), cleaned_leak)
+            cleaned_leak = re.sub(r"<sub>([0-9]+)</sub>", lambda sm: "".join({"0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉"}.get(c, c) for c in sm.group(1)), cleaned_leak)
+            cleaned_leak = re.sub(r"</?(?:sup|sub)>", "", cleaned_leak)
+            text = cleaned_leak
+
+        # 4. 还原占位符
+        for k, v in placeholder_map.items():
+            text = text.replace(k, v)
 
         return text
 
     def _markdown_to_pdf_html(self, text: str, wrap_en_span: bool = False) -> str:
-        """Converts translated text with Markdown and script tags into HTML for insert_htmlbox"""
+        """将带 Markdown 粗斜体和 <sup>/<sub> 标签的译文转为适合 insert_htmlbox 的 HTML"""
         s = self._latex_math_to_rich_html(text.strip())
-        # Strip leading Markdown heading hashtags
+        # 移除开头的 Markdown 标题井号
         s = re.sub(r"^#{1,6}\s+", "", s)
-        # Protect existing <sup>, <sub>, <b>, <i> tags
+        # 保护已有的 <sup>, </sup>, <sub>, </sub>, <b>, </b>, <i>, </i> 标签
         tag_map: Dict[str, str] = {}
         counter = 0
 
@@ -425,16 +710,16 @@ class DocumentExporter:
             return key
 
         s = re.sub(r"</?(?:sup|sub|b|i)>", _stash_tag, s)
-        # Escape special HTML characters <, >, &
+        # 转义普通文本中的 <, >, &
         s = html.escape(s)
-        # Restore Markdown bold **...** and italic *...*
+        # 还原 Markdown 粗体 **...** 与斜体 *...*
         s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
         s = re.sub(r"\*(.+?)\*", r"<i>\1</i>", s)
-        # Restore HTML script tags
+        # 还原 HTML 上下标标签
         for k, v in tag_map.items():
             s = s.replace(k, v)
 
-        # Wrap western/alphanumeric characters with <span class="en">...</span> if dual-font rendering enabled
+        # 若开启中英分字体渲染：将非标签、非实体的西文/数字字符序列包裹为 <span class="en">...</span>
         if wrap_en_span:
             s = re.sub(
                 r"(<[^>]+>)|(&[a-zA-Z0-9#]+;)|([A-Za-z0-9_.,;:!?()\[\]{}+=\-*/~^@#$%&|'`\\]+)",
@@ -444,7 +729,7 @@ class DocumentExporter:
         return s
 
     def _build_pdf_htmlbox_payload(self, block: DocumentBlock) -> Tuple[str, str]:
-        """Generates (html_fragment, css_str) for PyMuPDF insert_htmlbox (SimSun for Chinese, Times New Roman for English)"""
+        """生成 PyMuPDF insert_htmlbox 所需的 (html_fragment, css_str)，中文统一为宋体，英文为 Times New Roman"""
         raw_txt = (block.translated_text or block.original_text or "").strip()
         html_inner = self._markdown_to_pdf_html(raw_txt, wrap_en_span=True)
 
@@ -489,7 +774,7 @@ class DocumentExporter:
         return f"<div>{html_inner}</div>", css
 
     # =========================================================================
-    # 2. Export interactive side-by-side bilingual HTML (_bilingual.html)
+    # 2. 导出原版对照双栏交互网页 (_bilingual.html)
     # =========================================================================
     def export_bilingual_html(
         self,
@@ -499,16 +784,16 @@ class DocumentExporter:
         renders_rel_dir: str = "page_renders"
     ) -> str:
         """
-        Exports interactive side-by-side bilingual HTML:
-        - If PDF page coordinate info exists (page_count > 0), displays 1:1 dual-column view:
-          * Left column: Original PDF page render + precise hotspot bounding boxes
-          * Right column: Identical dimensions showing translation, figures, and footnotes at exact (x0, y0, x1, y1)
-            (Supports toggling between PDF native vector layer and HTML live text layer, with sync hover highlight)
-        - Also includes full continuous flow bilingual tab.
+        导出真正的“左边原版 PDF + 右边相同坐标位置译文”交互式双栏 HTML：
+        - 若存在 PDF 页面坐标信息 (page_count > 0)，默认展示 1:1 原版页面双栏对照视图：
+          * 左栏：原版 PDF 页面渲染图 + 每个文本块/角注的精确坐标热区
+          * 右栏：1:1 同尺寸页面，在完全相同的 (x0, y0, x1, y1) 坐标位置展示译文、原位插图与角注
+            （支持一键切换【PDF原位精准排版层】与【HTML实时文字浮层】，支持左右悬停同步高亮与点击详情栏）
+        - 同时内置【全文流式双语对照视图（含原位插图与角注）】标签页。
         """
         has_pdf_pages = page_count > 0 and any(b.page_num is not None and b.bbox for b in blocks)
 
-        # Build page-by-page 1:1 coordinate comparison HTML
+        # 构建 PDF 逐页 1:1 坐标对照 HTML
         pages_spread_html: List[str] = []
         if has_pdf_pages:
             blocks_by_page: Dict[int, List[DocumentBlock]] = {}
@@ -567,14 +852,14 @@ class DocumentExporter:
                         <span class="spread-hint">左侧：原版 PDF 页面 &nbsp;|&nbsp; 右侧：相同坐标位置原位译文（含照片与角注）</span>
                     </div>
                     <div class="spread-columns">
-                        <!-- Left column: Original PDF -->
+                        <!-- 左栏：原版 PDF -->
                         <div class="pdf-page-card left-pdf-card" style="aspect-ratio: {pw} / {ph};">
                             <img class="page-img" src="{orig_img_src}" alt="Original PDF Page {pno + 1}" loading="lazy" />
                             <div class="hotspot-layer">
                                 {"".join(left_hotspots)}
                             </div>
                         </div>
-                        <!-- Right column: In-situ translated page -->
+                        <!-- 右栏：同位置译文页面 -->
                         <div class="pdf-page-card right-zh-card" style="aspect-ratio: {pw} / {ph};"
                              data-zh-img="{zh_img_src}" data-bg-img="{bg_img_src}">
                             <img class="page-img right-page-img" src="{zh_img_src}" alt="Translated Page {pno + 1}" loading="lazy" />
@@ -586,7 +871,7 @@ class DocumentExporter:
                 </div>
                 """)
 
-        # Build continuous stream comparison HTML with inline figures and footnotes
+        # 同时构建流式全文对照 HTML（包含提取出的原位图片与角注）
         stream_rows_html: List[str] = []
         for block in blocks:
             if block.type == BlockType.RAW:
@@ -939,18 +1224,18 @@ class DocumentExporter:
     </div>
 
     <div class="main-wrapper">
-        <!-- View 1: Original PDF + In-situ translation 1:1 side-by-side spread -->
+        <!-- 视图 1：左边原版 PDF + 右边相同位置译文 -->
         <div id="view-pdf-spread" class="{'' if default_view == 'pdf-spread' else 'hidden'}">
             {spread_section}
         </div>
 
-        <!-- View 2: Full Markdown streaming bilingual view -->
+        <!-- 视图 2：全文 Markdown 流式双语视图 -->
         <div id="view-stream" class="stream-container {'' if default_view == 'stream' else 'hidden'}">
             {stream_section}
         </div>
     </div>
 
-    <!-- Bottom synchronized inspector bar -->
+    <!-- 底部同步对照检视栏 -->
     <div class="inspector-bar" id="inspector-bar">
         <div class="inspector-col">
             <div class="inspector-label" id="insp-en-label">左侧原版 PDF 对应段落 / 角注（鼠标悬停任意区域同步定位）</div>
@@ -993,7 +1278,7 @@ class DocumentExporter:
             }});
         }}
 
-        // Synchronized hover highlighting and bottom inspector update for paired bounding boxes
+        // 左右同坐标框悬停同步高亮与底部检视器更新
         const allHotspots = document.querySelectorAll('.bbox-hotspot');
         const inspEn = document.getElementById('insp-en-text');
         const inspZh = document.getElementById('insp-zh-text');
@@ -1026,15 +1311,32 @@ class DocumentExporter:
 </html>"""
 
     # =========================================================================
-    # 3. Export Markdown and DOCX with inline figures and footnotes
+    # 3. 导出含原位插图与角注的 Markdown 及 DOCX
     # =========================================================================
     def export_bilingual_markdown(self, blocks: List[DocumentBlock]) -> str:
-        """Exports bilingual side-by-side Markdown with embedded figures and footnotes"""
+        """导出包含结构化排版格式、原位插图与页脚角注的双语交替对照 Markdown"""
         lines: List[str] = []
         emitted_abstract_heading = False
 
         for block in blocks:
             if block.type == BlockType.RAW:
+                continue
+
+            # 跨页接续块跳过独立输出（已在前半段合并）
+            if block.is_cross_page_head and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                continue
+
+            # 跨页前半段合并输出
+            if block.is_cross_page_tail and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                partner_id = block.cross_page_partner_id
+                partner = next((b for b in blocks if b.id == partner_id), None)
+                partner_en = partner.original_text.strip() if partner else ""
+                full_en = f"{block.original_text.strip()} {partner_en}"
+                full_zh = self._clean_markdown_text(block.metadata["full_combined_zh"])
+                lines.append(f"> **[EN]** {full_en}")
+                lines.append(">")
+                lines.append(f"> **[ZH]** {full_zh}")
+                lines.append("")
                 continue
 
             is_abstract_sec = bool(block.metadata and block.metadata.get("is_abstract")) or (
@@ -1063,7 +1365,7 @@ class DocumentExporter:
             if block.type in (BlockType.TITLE, BlockType.HEADER_1, BlockType.HEADER_2, BlockType.HEADER_3):
                 lines.append(block.original_text)
                 if block.translated_text and block.translated_text != block.original_text:
-                    lines.append(block.translated_text)
+                    lines.append(self._clean_markdown_text(block.translated_text))
                 lines.append("")
                 continue
 
@@ -1088,7 +1390,7 @@ class DocumentExporter:
                 continue
 
             en_text = block.original_text.strip()
-            zh_text = (block.translated_text or block.original_text).strip()
+            zh_text = self._clean_markdown_text((block.translated_text or block.original_text).strip())
 
             if block.type == BlockType.FOOTNOTE:
                 lines.append(f"> **[角注 EN]** {en_text}")
@@ -1104,12 +1406,20 @@ class DocumentExporter:
         return "\n".join(lines)
 
     def export_pure_translated_markdown(self, blocks: List[DocumentBlock]) -> str:
-        """Exports translated Chinese Markdown with embedded figures and footnotes"""
+        """导出包含结构化排版格式、原位插图与页脚角注的纯中文 Markdown"""
         lines: List[str] = []
         emitted_abstract_heading = False
 
         for block in blocks:
             if block.type == BlockType.RAW:
+                continue
+
+            if block.is_cross_page_head and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                continue
+
+            if block.is_cross_page_tail and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                lines.append(self._clean_markdown_text(block.metadata["full_combined_zh"]))
+                lines.append("")
                 continue
 
             is_abstract_sec = bool(block.metadata and block.metadata.get("is_abstract")) or (
@@ -1141,15 +1451,15 @@ class DocumentExporter:
                     lines.append(ref_txt)
                     lines.append("")
             elif block.type == BlockType.FOOTNOTE:
-                lines.append(f"> {block.translated_text if block.translated_text else block.original_text}")
+                lines.append(f"> {self._clean_markdown_text(block.translated_text if block.translated_text else block.original_text)}")
             else:
-                lines.append(block.translated_text if block.translated_text else block.original_text)
+                lines.append(self._clean_markdown_text(block.translated_text if block.translated_text else block.original_text))
             lines.append("")
 
         return "\n".join(lines)
 
     # =========================================================================
-    # 4. Export formatted Word document matching original PDF layout (Songti + Times New Roman)
+    # 4. 导出与原版 PDF 版式一致的 Word 文档 (中文统一为宋体，英文为 Times New Roman)
     # =========================================================================
     def export_bilingual_docx(
         self,
@@ -1158,7 +1468,7 @@ class DocumentExporter:
         base_dir: Optional[Path] = None,
         source_pdf_path: Optional[Path] = None
     ) -> str:
-        """Exports side-by-side bilingual Word document matching original PDF layout"""
+        """导出与原版 PDF 格式一致、逐段双语对照的 Word 文档（中文统一为宋体，英文为 Times New Roman）"""
         return self._build_academic_docx(
             blocks=blocks,
             output_path=output_path,
@@ -1174,7 +1484,7 @@ class DocumentExporter:
         base_dir: Optional[Path] = None,
         source_pdf_path: Optional[Path] = None
     ) -> str:
-        """Exports translated Chinese Word document matching original PDF layout"""
+        """导出与原版 PDF 格式一致的纯中文译文 Word 文档（中文统一为宋体，英文为 Times New Roman）"""
         return self._build_academic_docx(
             blocks=blocks,
             output_path=output_path,
@@ -1182,6 +1492,31 @@ class DocumentExporter:
             source_pdf_path=source_pdf_path,
             bilingual=False
         )
+
+    @staticmethod
+    def _sanitize_for_docx(text: str) -> str:
+        """
+        清洗文本，替换 TeX 数学字体遗留的控制字符括号，并剔除所有不符合 XML 1.0 规范的字符。
+        防止 python-docx 抛出 ValueError: All strings must be XML compatible: Unicode or ASCII, no NULL bytes or control characters
+        """
+        if not text:
+            return ""
+        char_map = {
+            "\x00": "[",
+            "\x01": "]",
+            "\x02": "[",
+            "\x03": "]",
+            "\x10": "(",
+            "\x11": ")",
+            "\x12": "[",
+            "\x13": "]",
+            "\x14": "{",
+            "\x15": "}",
+        }
+        for k, v in char_map.items():
+            if k in text:
+                text = text.replace(k, v)
+        return re.sub(r"[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]", "", text)
 
     def _set_docx_run_font(
         self,
@@ -1194,7 +1529,7 @@ class DocumentExporter:
         subscript: bool = False,
         east_asia_font: str = "宋体"
     ):
-        """Sets Word Run font: Times New Roman for Latin/digits/symbols, SimHei for bold headings, SimSun for body text"""
+        """强制设置 Word Run 字体：英文/数字/符号统一为 Times New Roman，标题加粗中文统一为黑体，正文中文统一为宋体"""
         run.font.name = "Times New Roman"
         run.font.size = Pt(size_pt)
         run.bold = bold
@@ -1220,8 +1555,10 @@ class DocumentExporter:
         color_rgb: Tuple[int, int, int] = (0, 0, 0)
     ):
         """
-        Parses Markdown and HTML tags to write formatted Runs with native sub/superscripts, bold, and italics.
+        解析文本中的 Markdown (**粗体**, *斜体*) 与 HTML (<b>, <i>, <sup>, <sub>) 标签，
+        向 Word 段落写入带真实上下标、粗斜体及【中文宋体 + 英文 Times New Roman】的 Runs。
         """
+        text = self._sanitize_for_docx(text)
         has_leading_space = text.startswith(" ")
         has_trailing_space = text.endswith(" ")
         s = self._latex_math_to_rich_html(text.strip())
@@ -1230,9 +1567,9 @@ class DocumentExporter:
             s = " " + s
         if has_trailing_space:
             s = s + " "
-        # Convert Markdown **...** to <b>...</b>
+        # 将 Markdown **...** 转为 <b>...</b>
         s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
-        # Bold caption prefix if present (e.g. Figure 1: / Table 1:)
+        # 若为图表题注开头 (Figure 1: / 图1：/ Table 1: / 表1：)，自动加粗编号前缀
         s = re.sub(
             r"^((?:Figure|Fig\.|Table)\s*\d+\s*[:.]|(?:图|表)\s*\d+\s*[：:.])",
             r"<b>\1</b>",
@@ -1270,6 +1607,7 @@ class DocumentExporter:
                 sub = False
             else:
                 clean_tok = html.unescape(tok)
+                clean_tok = self._sanitize_for_docx(clean_tok)
                 if clean_tok:
                     r = p.add_run(clean_tok)
                     self._set_docx_run_font(
@@ -1290,7 +1628,7 @@ class DocumentExporter:
         top_space: int = 8,
         bottom_space: int = 8
     ):
-        """Adds academic-style top/bottom border rules to Word paragraph"""
+        """为 Word 段落添加学术论文风格顶/底横线边框 (如 NIPS 标题上下横线或页脚角注分割线)"""
         pPr = p._p.get_or_add_pPr()
         pBdr = OxmlElement("w:pBdr")
         if top_sz is not None:
@@ -1316,11 +1654,11 @@ class DocumentExporter:
         source_pdf_path: Optional[Path]
     ) -> List[Dict]:
         """
-        Organizes raw block sequence into flowing layout units matching original PDF:
-        1. Merges adjacent AUTHOR_INFO blocks on same page into centered borderless author grid
-        2. Merges fragmented TABLE / MATH_BLOCKs and crops high-resolution figures/tables from PDF
-        3. Filters duplicate subpanel headings already inside figures
-        4. Re-orders top-of-page floating figures after unended cross-page sentences
+        将原始块序列整理为与原版 PDF 版式一致的流式排版单元：
+        1. 自动合并同页相邻的 AUTHOR_INFO 块为居中无边框多列作者网格
+        2. 自动合并同页相邻的 TABLE / MATH_BLOCK 碎片，并从原版 PDF 裁剪 250 DPI 高清三线表与独立公式图
+        3. 过滤已包含在插图内部的重复子标题（如 Figure 2 内部顶部的两个子图名）
+        4. 自动将打断跨页句子的页顶浮动图表移至该句闭合之后，并将同页角注归集至该页末尾
         """
         pdf_doc = None
         if source_pdf_path and Path(source_pdf_path).exists():
@@ -1332,7 +1670,7 @@ class DocumentExporter:
         crops_dir = (base_dir / "images") if base_dir else Path("./output/images")
         crops_dir.mkdir(parents=True, exist_ok=True)
 
-        # Group and preprocess by page
+        # 按页分组预处理
         pages_map: Dict[int, List[DocumentBlock]] = {}
         for b in blocks:
             if b.type == BlockType.RAW:
@@ -1344,7 +1682,7 @@ class DocumentExporter:
 
         for pno in sorted(pages_map.keys()):
             p_blocks = pages_map[pno]
-            # Filter short sub-titles located entirely inside IMAGE blocks
+            # 找出本页所有 IMAGE 块的 bbox，过滤完全落在 IMAGE 块内部的短子标题
             img_bboxes = [b.bbox for b in p_blocks if b.type == BlockType.IMAGE and b.bbox]
 
             filtered_blocks: List[DocumentBlock] = []
@@ -1358,18 +1696,18 @@ class DocumentExporter:
                         continue
                 filtered_blocks.append(b)
 
-            # Separate footnotes from body/figure blocks
+            # 分离本页的页脚角注 (FOOTNOTE) 与正文/图表块
             page_footnotes = [b for b in filtered_blocks if b.type == BlockType.FOOTNOTE]
             main_blocks = [b for b in filtered_blocks if b.type != BlockType.FOOTNOTE]
 
-            # Aggregate consecutive AUTHOR_INFO, TABLE, and MATH_BLOCKs into unified units
+            # 将连续的 AUTHOR_INFO、连续的 TABLE、连续的 MATH_BLOCK 聚合成排版单元
             page_units: List[Dict] = []
             i = 0
             n = len(main_blocks)
             while i < n:
                 b = main_blocks[i]
 
-                # 1. Author info grid aggregation
+                # 1. 作者信息网格聚合
                 if b.type == BlockType.AUTHOR_INFO:
                     auth_group = [b]
                     j = i + 1
@@ -1380,7 +1718,7 @@ class DocumentExporter:
                     i = j
                     continue
 
-                # 2. Academic three-line table aggregation and high-res crop
+                # 2. 原版学术三线表聚合与高清裁剪
                 if b.type == BlockType.TABLE:
                     tbl_group = [b]
                     j = i + 1
@@ -1412,7 +1750,7 @@ class DocumentExporter:
                     i = j
                     continue
 
-                # 3. Display math block aggregation and high-res crop
+                # 3. 独立数学公式块聚合与高清裁剪
                 if b.type == BlockType.MATH_BLOCK:
                     eq_group = [b]
                     j = i + 1
@@ -1434,7 +1772,7 @@ class DocumentExporter:
                         y0 = max(10.0, min(bb[1] for bb in bboxes) - 5.0)
                         x1 = min(p_rect.width - 10.0, max(bb[2] for bb in bboxes) + 6.0)
                         y1 = min(p_rect.height - 10.0, max(bb[3] for bb in bboxes) + 5.0)
-                        # Defensive check: only crop as standalone formula when width >= 35pt
+                        # 防御性校验：仅当裁剪区域宽度 >= 35pt 时作为独立公式裁剪，防止行内短碎片误截
                         if (x1 - x0) >= 35.0:
                             rect = pymupdf.Rect(x0, y0, x1, y1)
                             pix = pdf_doc[pno].get_pixmap(clip=rect, dpi=250)
@@ -1452,12 +1790,12 @@ class DocumentExporter:
                     i = j
                     continue
 
-                # 4. Regular blocks (TITLE, HEADER, PARAGRAPH, IMAGE, IMAGE_CAPTION, LIST_ITEM, REFERENCE)
+                # 4. 普通块 (TITLE, HEADER, PARAGRAPH, IMAGE, IMAGE_CAPTION, LIST_ITEM, REFERENCE)
                 page_units.append({"kind": "single", "block": b, "page_num": pno})
                 i += 1
 
-            # If top of page is floating figure/table and subsequent block continues cross-page sentence (lowercase),
-            # place continuing sentence before floating figure to maintain reading continuity
+            # 如果本页顶部是浮动插图/表格 (IMAGE / IMAGE_CAPTION / cropped_table)，且紧随其后的第一个正文块是跨页续句（首字母小写），
+            # 则将该跨页续句移至页顶浮动图表之前，保证跨页段落语义不被图表截断
             float_prefix: List[Dict] = []
             rest_units: List[Dict] = []
             in_prefix = True
@@ -1492,8 +1830,8 @@ class DocumentExporter:
         return structured_items
 
     def _render_author_grid_docx(self, doc, author_blocks: List[DocumentBlock]):
-        """Constructs centered borderless multi-column author grid in Word"""
-        # Merge adjacent name and affiliation/email blocks into author card
+        """在 Word 中还原与原版 PDF 一致的无边框居中多列作者网格"""
+        # 将同一列上下紧邻的姓名块与机构/邮箱块合并为一个作者卡片
         merged_authors: List[List[str]] = []
         for b in author_blocks:
             txt = b.original_text.strip()
@@ -1533,7 +1871,7 @@ class DocumentExporter:
             p.paragraph_format.line_spacing = 1.15
 
             full_str = " ".join(lines_list)
-            # Display author name, affiliation, and email on separate lines
+            # 将作者姓名与机构、邮箱分行展示
             parts = re.split(r"\s+(?=(?:Google|University|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+))", full_str)
             for p_i, part in enumerate(parts):
                 if p_i > 0:
@@ -1556,16 +1894,16 @@ class DocumentExporter:
         bilingual: bool = True
     ) -> str:
         """
-        Builds academic Word document matching original PDF layout:
-        - Consistent typography: SimSun for Chinese, Times New Roman for Latin/digits/symbols
-        - Preserved layout: title rules, author grid, abstract indent, three-line tables, figures, footnotes, hanging indent references
+        构建与原版 PDF 格式一致的学术论文 Word 文档：
+        - 严格统一字体：中文为【宋体】，英文/数字/符号为【Times New Roman】
+        - 严格还原版式：NIPS 顶底双横线标题、居中作者网格、缩进摘要、原版高清三线表与独立公式、居中插图与题注、页脚分割线角注、悬挂缩进参考文献
         """
         if not DOCX_AVAILABLE:
-            raise ImportError("python-docx is not installed, cannot export .docx file")
+            raise ImportError("未安装 python-docx，无法导出 .docx 文件")
 
         doc = Document()
 
-        # 1. Page dimensions and margins (adaptive to original PDF geometry)
+        # 1. 页面尺寸与页边距（自适应原版 PDF 几何尺寸与排版风格）
         doc_is_two_col = any(b.metadata.get("is_two_col", False) for b in blocks if b.metadata)
         pdf_w_in, pdf_h_in = 8.5, 11.0
         if source_pdf_path and Path(source_pdf_path).exists():
@@ -1586,7 +1924,7 @@ class DocumentExporter:
             s.left_margin = Inches(1.0)
             s.right_margin = Inches(1.0)
 
-        # 2. Configure default Normal style (SimSun + Times New Roman)
+        # 2. 设置全局默认样式 Normal 为【中文宋体 + 英文 Times New Roman】
         normal_style = doc.styles["Normal"]
         normal_style.font.name = "Times New Roman"
         normal_style.font.size = Pt(10.0)
@@ -1605,12 +1943,12 @@ class DocumentExporter:
         for item in items:
             kind = item["kind"]
 
-            # (A) Author grid
+            # (A) 作者网格
             if kind == "author_grid":
                 self._render_author_grid_docx(doc, item["blocks"])
                 continue
 
-            # (B) Original high-res table or display formula
+            # (B) 原版高清三线表或独立数学公式
             if kind in ("cropped_table", "cropped_eq"):
                 crop_path = item.get("crop_path")
                 width_in = item.get("width_in", 4.5)
@@ -1631,7 +1969,7 @@ class DocumentExporter:
                         self._add_rich_runs_to_paragraph(p, clean_eq, size_pt=10.0)
                 continue
 
-            # (C) Footnote area (with top divider rule + 8.5pt font)
+            # (C) 页脚角注区（带顶部分割细线 + 小五号 8.5pt 宋体/Times New Roman）
             if kind == "footnotes":
                 fn_blocks = item["blocks"]
                 for idx_f, fb in enumerate(fn_blocks):
@@ -1665,12 +2003,14 @@ class DocumentExporter:
                         self._add_rich_runs_to_paragraph(p_zh, zh_txt, size_pt=8.5, color_rgb=(0, 0, 0))
                 continue
 
-            # (D) Regular block elements
+            # (D) 常规单块元素
             block: DocumentBlock = item["block"]
-            en_txt = block.original_text.strip()
-            zh_txt = (block.translated_text or block.original_text).strip()
+            if block.is_cross_page_head and block.metadata and block.metadata.get("full_combined_zh"):
+                continue
+            en_txt = (block.metadata.get("full_combined_text") if block.metadata and block.metadata.get("full_combined_text") else block.original_text).strip()
+            zh_txt = (block.metadata.get("full_combined_zh") if block.metadata and block.metadata.get("full_combined_zh") else (block.translated_text or block.original_text)).strip()
 
-            # Structured abstract title: output centered bold Abstract title if not yet emitted
+            # 结构化摘要统领标题：如果遇到结构化摘要小节且尚未输出 Abstract 标题，先输出居中加粗 Abstract / 摘要 标题
             is_abstract_sec = bool(block.metadata and block.metadata.get("is_abstract")) or (
                 block.page_num == 0 and bool(re.match(r"^\*\*(Background|Methods|Results|Conclusions|Objective|Findings|Interpretation)\*\*", en_txt))
             )
@@ -1687,7 +2027,7 @@ class DocumentExporter:
                     else:
                         self._add_rich_runs_to_paragraph(p_abs, "摘要", size_pt=12.0, base_bold=True, color_rgb=(0, 0, 0))
 
-            # 1. Figure block (BlockType.IMAGE)
+            # 1. 插图块 (BlockType.IMAGE)
             if block.type == BlockType.IMAGE and block.image_path and base_dir:
                 img_full = base_dir / block.image_path
                 if img_full.exists():
@@ -1703,7 +2043,7 @@ class DocumentExporter:
                     r.add_picture(str(img_full), width=Inches(w_in))
                 continue
 
-            # 2. Paper title (BlockType.TITLE - centered with top/bottom border rules)
+            # 2. 论文主标题 (BlockType.TITLE - NIPS 顶底横线居中大标题)
             if block.type == BlockType.TITLE:
                 p = doc.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1719,7 +2059,7 @@ class DocumentExporter:
                     self._add_rich_runs_to_paragraph(p, zh_txt, size_pt=17.0, base_bold=True, color_rgb=(0, 0, 0))
                 continue
 
-            # 3. Section headings (HEADER_1, HEADER_2, HEADER_3)
+            # 3. 各级章节标题 (HEADER_1, HEADER_2, HEADER_3)
             if block.type in (BlockType.HEADER_1, BlockType.HEADER_2, BlockType.HEADER_3):
                 plain_en = re.sub(r"^#{1,6}\s+", "", en_txt).strip()
                 is_abstract = plain_en.lower() == "abstract"
@@ -1753,7 +2093,7 @@ class DocumentExporter:
                     self._add_rich_runs_to_paragraph(p, zh_txt, size_pt=sz, base_bold=True, color_rgb=(0, 0, 0))
                 continue
 
-            # 4. Caption block (BlockType.IMAGE_CAPTION)
+            # 4. 图表题注 (BlockType.IMAGE_CAPTION)
             if block.type == BlockType.IMAGE_CAPTION:
                 align = WD_ALIGN_PARAGRAPH.CENTER if block.align == "center" else WD_ALIGN_PARAGRAPH.JUSTIFY
                 if bilingual:
@@ -1780,7 +2120,7 @@ class DocumentExporter:
                     self._add_rich_runs_to_paragraph(p_zh, zh_txt, size_pt=9.5, color_rgb=(0, 0, 0))
                 continue
 
-            # 5. Reference entry (BlockType.REFERENCE - hanging indent)
+            # 5. 参考文献条目 (BlockType.REFERENCE - 原文单段输出 + 悬挂缩进)
             if block.type == BlockType.REFERENCE:
                 is_new_entry = bool(re.match(r"^(\[\d+\]|\d+\.\s*|\d+\t|\d+\.$)", en_txt.strip()))
                 is_continuation = bool(block.metadata and block.metadata.get("is_ref_continuation")) or (not is_new_entry)
@@ -1793,7 +2133,7 @@ class DocumentExporter:
                         prev_is_heading = True
 
                 if is_continuation and doc.paragraphs and not prev_is_heading:
-                    # Append continuation lines to preceding reference entry to preserve single-paragraph hanging indent
+                    # 若属于跨页或断行拆分出的续行，平滑追加至上一段文献末尾，保持单个段落悬挂缩进
                     prev_p = doc.paragraphs[-1]
                     self._add_rich_runs_to_paragraph(prev_p, " " + en_txt, size_pt=9.0, color_rgb=(40, 40, 40))
                     continue
@@ -1808,7 +2148,19 @@ class DocumentExporter:
                 self._add_rich_runs_to_paragraph(p_ref, en_txt, size_pt=9.0, color_rgb=(40, 40, 40))
                 continue
 
-            # 6. Body prose (PARAGRAPH) and list items (LIST_ITEM)
+            # 跨页接续块跳过独立输出（已在前半段合并）
+            if block.is_cross_page_head and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                continue
+
+            # 跨页前半段合并输出
+            if block.is_cross_page_tail and block.metadata.get("full_combined_zh") and getattr(self, "para_format", "reorganize") == "reorganize":
+                partner_id = block.cross_page_partner_id
+                partner = next((b for b in blocks if b.id == partner_id), None)
+                partner_en = partner.original_text.strip() if partner else ""
+                en_txt = f"{en_txt} {partner_en}"
+                zh_txt = block.metadata["full_combined_zh"]
+
+            # 6. 正文自然段 (PARAGRAPH) 与列表项 (LIST_ITEM)
             is_abs_para = next_is_abstract_body or is_abstract_sec
             next_is_abstract_body = False
             left_ind = Inches(0.42) if is_abs_para else (Inches(0.25) if block.type == BlockType.LIST_ITEM else Inches(0.0))

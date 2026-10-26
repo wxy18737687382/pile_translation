@@ -5,20 +5,20 @@ from pipeline.models import DocumentBlock, BlockType, ChunkConfig, ChunkGranular
 
 class Chunker:
     """
-    Aggregates or splits a sequence of DocumentBlocks according to configured granularity and length constraints:
-    1. SENTENCE: Sentence-level splitting (sentence-by-sentence bilingual alignment)
-    2. PARAGRAPH: Default paragraph-level (preserves native layout)
-    3. DYNAMIC_WINDOW: Adjustable length window (smart merge of short blocks or split of oversized blocks via min_length / max_length)
+    负责将 DocumentBlock 序列按照设定的粒度与长度要求进行聚合或切分：
+    1. SENTENCE: 句子级切分（逐句对照）
+    2. PARAGRAPH: 默认段落级（保持原生排版）
+    3. DYNAMIC_WINDOW: 可调节长度窗口（按 min_length / max_length 智能合并碎片段落或拆分超长段落）
     """
 
     def __init__(self, config: ChunkConfig = None):
         self.config = config or ChunkConfig()
-        # Regex for English sentence boundaries without erroneously breaking on common academic abbreviations
+        # 英文句子边界断句正则（考虑常见缩写如 e.g., i.e., et al., Fig. 等不误切）
         self.abbr_pattern = re.compile(r"\b(e\.g\.|i\.e\.|et al\.|Fig\.|Eq\.|Ref\.|vs\.|Dr\.|Prof\.)\s*$", re.IGNORECASE)
 
     def split_into_sentences(self, text: str) -> List[str]:
-        """Splits text into sentences while avoiding incorrect splitting on common academic abbreviations"""
-        # Initial punctuation split: period, question mark, or exclamation mark followed by whitespace and uppercase/digit
+        """按句子切分文本，同时避免在学术常见缩写处错误断句"""
+        # 初步切分标点：句号、问号、感叹号后跟空格与大写字符/数字
         raw_splits = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'‘“])", text.strip())
         sentences: List[str] = []
         buffer = ""
@@ -27,7 +27,7 @@ class Chunker:
             if not part:
                 continue
             if buffer:
-                # Check if buffer ends with a known abbreviation
+                # 检查 buffer 结尾是否为已知缩写
                 if self.abbr_pattern.search(buffer):
                     buffer += " " + part
                     continue
@@ -43,7 +43,7 @@ class Chunker:
         return sentences if sentences else [text]
 
     def process(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
-        """Processes all document blocks based on configured granularity"""
+        """根据配置的粒度处理所有块"""
         if self.config.granularity == ChunkGranularity.PARAGRAPH:
             return blocks
 
@@ -56,11 +56,11 @@ class Chunker:
         return blocks
 
     def _process_sentence_level(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
-        """Refines paragraph blocks into sentence-level blocks; structural blocks (headings, math, tables, code) remain intact"""
+        """将段落块细化为句子级块，非段落块（标题、公式、表格、代码）保持原样"""
         result: List[DocumentBlock] = []
 
         for block in blocks:
-            # Only regular paragraphs and list items are split into sentences; headings and structure blocks remain independent
+            # 只有普通段落或列表项进行逐句拆分，标题和结构块保持独立
             if block.type in (BlockType.PARAGRAPH, BlockType.LIST_ITEM):
                 sentences = self.split_into_sentences(block.original_text)
                 if len(sentences) <= 1:
@@ -82,10 +82,10 @@ class Chunker:
 
     def _process_dynamic_window(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
         """
-        Dynamically adjusts block lengths:
-        - Structural blocks (headings, math, tables) always remain independent.
-        - Short adjacent paragraphs (under same section) are merged towards target_length.
-        - Long paragraphs exceeding max_length are safely split along sentence boundaries.
+        动态调节长度：
+        - 标题、公式、表格等结构块始终保持独立。
+        - 过短的相邻段落（在同一小节下）合并至接近 target_length 或超过 min_length。
+        - 超过 max_length 的长段落按句子边界安全拆分。
         """
         result: List[DocumentBlock] = []
         current_section = "root"
@@ -99,7 +99,7 @@ class Chunker:
             if len(merge_buffer) == 1:
                 result.append(merge_buffer[0])
             else:
-                # Merge multiple short paragraphs
+                # 合并多个短段落
                 combined_text = "\n\n".join(b.original_text for b in merge_buffer)
                 merged_block = DocumentBlock(
                     id=f"{merge_buffer[0].id}_merged_{len(merge_buffer)}",
@@ -116,7 +116,7 @@ class Chunker:
             buffer_length = 0
 
         for block in blocks:
-            # When encountering a heading or special structural block, flush current buffer first
+            # 遇到标题或特殊结构块，必须先清空当前合并缓冲区
             if block.type in (BlockType.TITLE, BlockType.HEADER_1, BlockType.HEADER_2, BlockType.HEADER_3):
                 flush_buffer()
                 current_section = block.original_text
@@ -139,10 +139,10 @@ class Chunker:
                 result.append(block)
                 continue
 
-            # Regular paragraph handling
+            # 普通段落处理
             text_len = len(block.original_text)
 
-            # Oversized paragraph: flush buffer first, then split along sentence boundaries
+            # 超长段落：先清空前面的 buffer，然后对其按句子拆分
             if text_len > self.config.max_length:
                 flush_buffer()
                 sentences = self.split_into_sentences(block.original_text)
@@ -169,15 +169,15 @@ class Chunker:
                     ))
                 continue
 
-            # Check if block can be merged into current buffer
+            # 检查是否可以与当前 buffer 合并
             if buffer_length + text_len <= self.config.target_length:
                 merge_buffer.append(block)
                 buffer_length += text_len
-                # Flush if min_length and target_length are reached
+                # 如果已经达到 min_length 且接近 target，可选择冲刷
                 if buffer_length >= self.config.min_length and buffer_length >= self.config.target_length:
                     flush_buffer()
             else:
-                # Flush existing buffer and start new buffer
+                # 超过目标长度，将之前的 buffer 冲刷并开始新 buffer
                 flush_buffer()
                 merge_buffer.append(block)
                 buffer_length = text_len

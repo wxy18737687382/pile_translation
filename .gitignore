@@ -34,11 +34,15 @@ build/
 # Scratch & temporary development files
 scratch/
 *.log
+unimernet_debug/
+debug_logs/
+services/unimernet_service/debug_logs/
+.translation_cache.json
+*.jsonl
 
-# Large sample/test PDF binaries (keeps repository lightweight)
-2026.06.02.26354731v1.full.pdf
-s41563-026-02594-7.pdf
-text.pdf
+# Large sample/test PDF binaries (keeps repository lightweight, only keep sample_paper.pdf)
+*.pdf
+!sample_paper.pdf
 
 # IDE and OS files
 .vscode/

@@ -25,7 +25,7 @@ DEFAULT_SYSTEM_PROMPT = """你是一位顶尖的学术文献翻译专家与资�
 
 class AcademicTranslator:
     """
-    Handles academic text translation via LLM, format/footnote protection, and persistent caching.
+    负责调用大语言模型进行学术文本翻译、格式/角注保护与持久化缓存加速
     """
 
     def __init__(
@@ -36,8 +36,10 @@ class AcademicTranslator:
         temperature: float = 0.2,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         enable_reflection: bool = False,
-        cache_dir: str = "./output"
+        cache_dir: str = "./output",
+        para_format: str = "reorganize"
     ):
+        self.para_format = para_format
         self.api_key = (
             api_key
             or os.getenv("DEEPSEEK_API_KEY")
@@ -55,14 +57,14 @@ class AcademicTranslator:
         self.enable_reflection = enable_reflection
         self.masker = FormatMasker()
 
-        # Cache configuration
+        # 缓存配置
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / ".translation_cache.json"
         self._cache_lock = threading.Lock()
         self.cache: Dict[str, str] = self._load_cache()
 
-        # Smart Base URL resolution
+        # 智能适配 Base URL
         if not self.base_url and self.model_name.startswith("deepseek"):
             self.base_url = "https://api.deepseek.com"
         elif not self.base_url and "gemini" in self.model_name.lower():
@@ -72,9 +74,9 @@ class AcademicTranslator:
             "", "dummy", "your_api_key_here", "your_gemini_api_key_here", "your_deepseek_api_key_here"
         ):
             raise ValueError(
-                "No valid LLM API key detected!\n"
-                "Please configure DEEPSEEK_API_KEY or OPENAI_API_KEY in your .env file.\n"
-                "Tip: You can use --mock to run in simulation mode without API calls."
+                "未检测到有效的大模型 API 密钥！\n"
+                "请在项目根目录的 .env 文件中设置 DEEPSEEK_API_KEY 或 OPENAI_API_KEY。\n"
+                "💡 提示：若仅测试文档分块、公式保护与排版导出流程，可直接添加 --mock 参数运行模拟模式。"
             )
 
         client_kwargs = {"api_key": self.api_key}
@@ -83,12 +85,12 @@ class AcademicTranslator:
         self.client = OpenAI(**client_kwargs)
 
     def _normalize_cache_key(self, text: str) -> str:
-        """Generates normalized cache key"""
+        """生成标准化缓存键"""
         cleaned = re.sub(r"[\s*_#>]+", " ", text).strip().lower()
         return cleaned
 
     def _is_valid_cached_translation(self, text: str) -> bool:
-        """Validates cached translation quality, filtering out corrupted entries or LLM refusal patterns"""
+        """检查缓存译文是否纯净，剔除含未展开占位符、旧版乱码、大模型拒答提示或英文词粘连上标的残次条目"""
         if not text:
             return False
         bad_tokens = (
@@ -97,13 +99,13 @@ class AcademicTranslator:
         )
         if any(tok in text for tok in bad_tokens):
             return False
-        # Filter LLM refusal / canned apology phrases on very short text
+        # 严格过滤大模型在极短文本时的模板拒答反问
         if any(bad in text for bad in [
             "由于您只提供", "请提供需要翻译", "没有完整的学术内容", "无法提供翻译",
             "未提供需要翻译", "请提供待翻译", "没有提供任何内容"
         ]):
             return False
-        # Filter outdated cache entries where words stick to citation superscripts
+        # 严格过滤英文普通单词粘连上标的旧缓存（如 organization<sup>1</sup>, signalling<sup>16 等）
         if re.search(r"[a-zA-Z]{3,}\s*<sup>\d+", text):
             return False
         return True
@@ -122,7 +124,7 @@ class AcademicTranslator:
             except Exception:
                 data = {}
 
-        # Automatically extract clean translations from existing *_bilingual.md files to speed up repeat runs
+        # 自动从已有的 *_bilingual.md 提取历史纯净译文以加速重复运行
         for md_file in self.cache_dir.glob("*_bilingual.md"):
             try:
                 content = md_file.read_text(encoding="utf-8")
@@ -136,7 +138,7 @@ class AcademicTranslator:
                     zh_s = zh_raw.strip()
                     if not self._is_valid_cached_translation(zh_s) or not self._is_valid_cached_translation(en_s):
                         continue
-                    # Only reuse plain text paragraph cache without complex scripts
+                    # 仅复用不含复杂上下标的纯文本段落缓存
                     if "<sub" not in en_s and "<sup" not in en_s:
                         norm_k = self._normalize_cache_key(en_s)
                         if norm_k and norm_k not in data:
@@ -155,8 +157,8 @@ class AcademicTranslator:
             pass
 
     def translate_block(self, block: DocumentBlock) -> str:
-        """Translates a single DocumentBlock"""
-        # 1. Directly retain source text for code blocks, dividers, math blocks, images, author info, and references
+        """翻译单个 DocumentBlock"""
+        # 1. 对代码块、分割线、独立数学公式、图片、页码、作者栏、参考文献直接保留原文
         if block.type in (
             BlockType.CODE_BLOCK,
             BlockType.DIVIDER,
@@ -165,11 +167,11 @@ class AcademicTranslator:
             BlockType.RAW,
             BlockType.AUTHOR_INFO,
             BlockType.REFERENCE,
-        ) or (block.metadata and (block.metadata.get("is_reference") or block.metadata.get("is_ref_continuation"))):
+        ) or (block.metadata and (block.metadata.get("is_reference") or block.metadata.get("is_ref_continuation") or block.metadata.get("skip_translation") or block.metadata.get("is_sidebar"))):
             block.translated_text = block.original_text
             return block.original_text
 
-        # 2. Directly map short connective prepositions/conjunctions between formulas to avoid LLM refusals
+        # 2. 对公式间常见的极短过渡介词/连词直接规范化翻译，避免大模型拒答反问
         short_connectives = {
             "with": "其中",
             "where": "其中",
@@ -187,39 +189,39 @@ class AcademicTranslator:
             block.translated_text = short_connectives[strip_clean]
             return block.translated_text
 
-        # 3. Check exact text cache (exact match with HTML tags)
+        # 3. 检查精确文本缓存（带完整 HTML 上下标标签的精确匹配）
         exact_key = f"EXACT::{block.original_text.strip()}"
         with self._cache_lock:
             if exact_key in self.cache:
                 block.translated_text = self.cache[exact_key]
                 return block.translated_text
-            # If block has no scripts or footnote tags, check normalized cache
+            # 若本块不含任何上下标或角注标签，也可匹配归一化缓存
             if "<sub" not in block.original_text and "<sup" not in block.original_text:
                 norm_key = self._normalize_cache_key(block.original_text)
                 if norm_key in self.cache and block.type == BlockType.PARAGRAPH:
                     block.translated_text = self.cache[norm_key]
                     return block.translated_text
 
-        # 4. Extract and mask special formatting (formulas, variables, footnotes, citations, code)
+        # 4. 提取并屏蔽特殊格式 (公式、上下标变量、角注、引用、行内代码等)
         masked_text, placeholders = self.masker.mask(block.original_text)
         block.placeholders = placeholders
 
-        # 5. Call LLM for initial translation
+        # 5. 调用大模型进行初译
         raw_translation = self._call_llm(masked_text)
 
-        # Filter LLM refusal or questions on single words / very short inputs
+        # 过滤模型在单词/极短文本时的拒答或反问
         if any(bad in raw_translation for bad in [
             "由于您只提供", "请提供需要翻译", "没有完整的学术内容", "无法提供翻译",
             "未提供需要翻译", "请提供待翻译", "没有提供任何内容"
         ]):
             raw_translation = short_connectives.get(strip_clean, block.original_text)
 
-        # 6. Optional: Two-stage reflection and refinement
+        # 6. 可选：反思润色环节
         final_translation = raw_translation
         if self.enable_reflection and block.type == BlockType.PARAGRAPH and len(masked_text) > 80:
             final_translation = self._reflect_and_polish(masked_text, raw_translation)
 
-        # 7. Safely unmask placeholders
+        # 7. 安全还原占位符
         unmasked = self.masker.unmask(final_translation, placeholders)
         block.translated_text = unmasked
 
@@ -228,16 +230,102 @@ class AcademicTranslator:
 
         return unmasked
 
+    def _translate_cross_page_pair(self, tail_b: DocumentBlock, head_b: DocumentBlock):
+        """
+        换页断句/断词跨页协同翻译：
+        将跨页被截断的句子/段落合并为完整的语义上下文送入大模型，
+        彻底根除断词 (如 la- \n tent) 被误当作两句甚至翻出“帐篷扩散模型”的机翻灾难。
+        翻译完成后，在保证语义完整连贯的前提下，智能寻找中文句式标点边界进行合理分割，
+        分别回填至原版 PDF 各自页面的坐标框内。
+        """
+        if tail_b.translated_text and head_b.translated_text and tail_b.metadata.get("full_combined_zh"):
+            return
+
+        tail_src = tail_b.original_text.strip()
+        head_src = head_b.original_text.strip()
+        combined_source = tail_b.metadata.get("full_combined_text") or f"{tail_src} {head_src}"
+
+        # 临时封装为一个整体段落执行学术翻译与占位符保护
+        temp_block = DocumentBlock(
+            id=f"{tail_b.id}_crosspage_pair",
+            type=BlockType.PARAGRAPH,
+            original_text=combined_source,
+            level=tail_b.level,
+            page_num=tail_b.page_num
+        )
+        combined_zh = self.translate_block(temp_block)
+
+        # 比例与标点边界切分
+        len_tail = len(tail_src)
+        len_head = len(head_src)
+        ratio = len_tail / max(1, (len_tail + len_head))
+        target_pos = int(len(combined_zh) * ratio)
+
+        # 在切分目标点前后寻找最自然的标点断句位置 (优先句号/感叹号/问号，其次分号/冒号，最后逗号)
+        window = max(10, int(len(combined_zh) * 0.35))
+        min_p = max(0, target_pos - window)
+        max_p = min(len(combined_zh), target_pos + window)
+
+        best_idx = -1
+        best_priority = 0
+
+        for p_idx in range(min_p, max_p):
+            ch = combined_zh[p_idx]
+            if ch in ("。", "！", "？", "."):
+                priority = 4
+            elif ch in ("；", ";", "：", ":"):
+                priority = 3
+            elif ch in ("，", ","):
+                priority = 2
+            elif ch in (" ", "\u3000"):
+                priority = 1
+            else:
+                priority = 0
+
+            if priority > best_priority or (priority == best_priority and priority > 0 and abs(p_idx - target_pos) < abs(best_idx - target_pos)):
+                best_priority = priority
+                best_idx = p_idx
+
+        if best_idx != -1 and best_priority >= 2:
+            tail_zh = combined_zh[:best_idx + 1].strip()
+            head_zh = combined_zh[best_idx + 1:].strip().lstrip("，,；;。！!？?")
+        else:
+            tail_zh = combined_zh[:target_pos].strip()
+            head_zh = combined_zh[target_pos:].strip()
+
+        tail_b.translated_text = tail_zh
+        head_b.translated_text = head_zh
+        tail_b.metadata["full_combined_zh"] = combined_zh
+        head_b.metadata["full_combined_zh"] = combined_zh
+        head_b.metadata["already_translated_with_tail"] = True
+
     def translate_blocks_concurrently(
         self,
         blocks: List[DocumentBlock],
         max_workers: int = 8,
         on_progress: Optional[Callable[[], None]] = None
     ):
-        """Translates all blocks concurrently via thread pool, significantly reducing total waiting time"""
+        """多线程并发翻译所有块，大幅缩短整篇 PDF 的等待时间"""
+        id_map = {b.id: b for b in blocks}
+        pair_lock = threading.Lock()
+
         def _worker(b: DocumentBlock):
             try:
-                self.translate_block(b)
+                if b.metadata.get("already_translated_with_tail"):
+                    return
+                # 检查是否为跨页协同翻译对
+                if b.is_cross_page_tail and b.cross_page_partner_id and b.cross_page_partner_id in id_map:
+                    partner = id_map[b.cross_page_partner_id]
+                    with pair_lock:
+                        if not b.translated_text:
+                            self._translate_cross_page_pair(b, partner)
+                elif b.is_cross_page_head and b.cross_page_partner_id and b.cross_page_partner_id in id_map:
+                    partner = id_map[b.cross_page_partner_id]
+                    with pair_lock:
+                        if not b.translated_text:
+                            self._translate_cross_page_pair(partner, b)
+                else:
+                    self.translate_block(b)
             except Exception as e:
                 b.translated_text = b.original_text
             finally:
@@ -253,7 +341,7 @@ class AcademicTranslator:
             self._save_cache()
 
     def _call_llm(self, text: str) -> str:
-        """Calls LLM with built-in retry and fault tolerance mechanisms"""
+        """调用大模型单次生成，内置重试与容错机制"""
         max_retries = 3
         last_error = None
         for attempt in range(max_retries):
@@ -275,7 +363,7 @@ class AcademicTranslator:
                     raise last_error
 
     def _reflect_and_polish(self, source_masked: str, draft_trans: str) -> str:
-        """Two-stage reflection and polishing mechanism"""
+        """两阶段反思润色机制"""
         reflection_prompt = f"""你是一位资深学术期刊审稿人兼中文编辑。请审校以下学术翻译初稿，进行润色提升。
 要求：
 1. 修正任何生硬或欧化的句式，使其更符合中文学术期刊规范。
@@ -289,23 +377,6 @@ class AcademicTranslator:
 【初译稿】：
 {draft_trans}
 """
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    temperature=0.1,
-                    messages=[
-                        {"role": "system", "content": "你是一位专注于学术严谨性与语体润色的审校专家。"},
-                        {"role": "user", "content": reflection_prompt}
-                    ]
-                )
-                return response.choices[0].message.content.strip()
-            except Exception:
-                if attempt < max_retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-                else:
-                    return draft_trans
         max_retries = 2
         for attempt in range(max_retries):
             try:
